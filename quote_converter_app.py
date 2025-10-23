@@ -58,6 +58,94 @@ def sanitize_for_docx(text: str) -> str:
     return text
 
 # ===== UK → US quotes conversion (placeholder-based) =====
+
+def _detect_primary_style(text: str) -> str:
+    """Heuristic: detect whether text is UK-primary (‘…’) or US-primary (“…”).
+    Returns "UK", "US", or "UNKNOWN".
+    """
+    if not text:
+        return "UNKNOWN"
+    # Count likely opening glyphs
+    singles_open = len(re.findall(r'(^|[\s(\[{<])‘', text))
+    doubles_open = len(re.findall(r'(^|[\s(\[{<])“', text))
+    # Also check frequency overall (ignore apostrophes between letters)
+    singles_total = text.count("‘") + text.count("’")
+    doubles_total = text.count("“") + text.count("”")
+    # Simple thresholds
+    if singles_open >= doubles_open * 1.5 and singles_open >= 4:
+        return "UK"
+    if doubles_open >= singles_open * 1.2 and doubles_open >= 4:
+        return "US"
+    if doubles_total > singles_total * 1.2 and doubles_open >= 2:
+        return "US"
+    if singles_total > doubles_total * 1.5 and singles_open >= 2:
+        return "UK"
+    return "UNKNOWN"
+
+
+def normalize_quotes_to_us(text: str) -> str:
+    """Smart normalizer:
+       - Preserve apostrophes inside words.
+       - If text is already US-primary, do NOT flip it.
+       - If text is UK-primary, perform UK→US swap (placeholder-based).
+       - For straight quotes, 'smartify' them into US curly quotes using a simple state tracker.
+    """
+    if not text:
+        return text
+
+    # 0) Preserve apostrophes (straight or curly) inside words
+    APOS = "<<APOS>>"
+    text = re.sub(r"(?<=\w)[’'](?=\w)", APOS, text)
+
+    # 1) Decide if UK→US needed based on existing curly quotes
+    style = _detect_primary_style(text)
+
+    # 2) If UK: perform UK→US using the robust placeholder method
+    if style == "UK":
+        OPEN_S, CLOSE_S, OPEN_D, CLOSE_D = "<<OPEN_S>>", "<<CLOSE_S>>", "<<OPEN_D>>", "<<CLOSE_D>>"
+        t = (text.replace("‘", OPEN_S)
+                 .replace("’", CLOSE_S)
+                 .replace("“", OPEN_D)
+                 .replace("”", CLOSE_D))
+        # Word-initial elisions and decades: map closing-single placeholders to apostrophes
+        # We'll just ensure we don't treat placeholders between letters as quotes
+        t = re.sub(r'(?<=\w)'+re.escape(CLOSE_S)+r'(?=\w)', APOS, t)
+        for w in ("em","cause","til","tis","twas","sup","round","clock"):
+            t = re.sub(r'\b'+re.escape(CLOSE_S)+w+r'\b', APOS+w, t, flags=re.IGNORECASE)
+        t = re.sub(re.escape(CLOSE_S)+r'(?=\d{2}s\b)', APOS, t)
+        # Swap
+        t = (t.replace(OPEN_S,"“")
+               .replace(CLOSE_S,"”")
+               .replace(OPEN_D,"‘")
+               .replace(CLOSE_D,"’"))
+        text = t
+    else:
+        # 3) If US or UNKNOWN: do NOT flip curly quotes.
+        # Instead, smarten any remaining straight quotes "..." to US curly.
+        # Simple open/close state per line.
+        def smarten_line(line: str) -> str:
+            out = []
+            open_d = True  # assume double-quote starts as opening
+            i = 0
+            while i < len(line):
+                ch = line[i]
+                if ch == '"':
+                    out.append("“" if open_d else "”")
+                    open_d = not open_d
+                elif ch == "'":
+                    # standalone straight apostrophe -> curly apostrophe
+                    out.append("’")
+                else:
+                    out.append(ch)
+                i += 1
+            return "".join(out)
+        text = "\n".join(smarten_line(ln) for ln in text.split("\n"))
+
+    # 4) Restore apostrophes
+    text = text.replace(APOS, "’")
+    return text
+
+
 def uk_to_us_quotes(text: str) -> str:
     if not text:
         return text
@@ -81,13 +169,13 @@ def convert_docx_runs_to_us(doc: Document) -> None:
     # In-place conversion of all runs (paragraphs + tables)
     for p in doc.paragraphs:
         for r in p.runs:
-            r.text = uk_to_us_quotes(sanitize_for_docx(r.text))
+            r.text = normalize_quotes_to_us(sanitize_for_docx(r.text))
     for t in doc.tables:
         for row in t.rows:
             for cell in row.cells:
                 for p in cell.paragraphs:
                     for r in p.runs:
-                        r.text = uk_to_us_quotes(sanitize_for_docx(r.text))
+                        r.text = normalize_quotes_to_us(sanitize_for_docx(r.text))
 
 def convert_docx_bytes_to_us(docx_bytes: bytes) -> bytes:
     if Document is None:
