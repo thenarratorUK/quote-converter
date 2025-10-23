@@ -2,5 +2,5 @@ streamlit
 python-docx
 pdfminer.six
 PyPDF2
-pymupdf
-pdf2docx
+pdf2docx==0.5.8
+PyMuPDF==1.26.4
