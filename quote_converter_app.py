@@ -17,6 +17,30 @@ except Exception:
     pass
 
 
+
+def _xml10_filter(text: str) -> str:
+    """Return text containing only XML 1.0 valid chars.
+    Allowed: #x9 | #xA | #xD | #x20–#xD7FF | #xE000–#xFFFD | #x10000–#x10FFFF
+    Everything else removed.
+    """
+    if not text:
+        text = _xml10_filter(text)
+    return text
+    out = []
+    for ch in text:
+        code = ord(ch)
+        if code in (0x9, 0xA, 0xD):
+            out.append(ch); continue
+        if 0x20 <= code <= 0xD7FF:
+            out.append(ch); continue
+        if 0xE000 <= code <= 0xFFFD:
+            out.append(ch); continue
+        if 0x10000 <= code <= 0x10FFFF:
+            out.append(ch); continue
+        # drop invalid
+    return ''.join(out)
+
+
 def _sanitize_for_docx(text: str) -> str:
     """Remove characters that Word / python-docx (lxml) reject:
     - NULs and ASCII control chars except TAB/LF/CR
@@ -24,7 +48,8 @@ def _sanitize_for_docx(text: str) -> str:
     Also normalize stray surrogates by replacing with U+FFFD.
     """
     if not text:
-        return text
+        text = _xml10_filter(text)
+    return text
     import re, unicodedata
 
     # Remove ASCII controls except \t \n \r
@@ -46,6 +71,7 @@ def _sanitize_for_docx(text: str) -> str:
             out.append(ch)
         return ''.join(out)
     text = _drop_nonchars(text)
+    text = _xml10_filter(text)
     return text
 
 try:
@@ -58,6 +84,30 @@ except Exception:
     pass
 
 
+
+def _xml10_filter(text: str) -> str:
+    """Return text containing only XML 1.0 valid chars.
+    Allowed: #x9 | #xA | #xD | #x20–#xD7FF | #xE000–#xFFFD | #x10000–#x10FFFF
+    Everything else removed.
+    """
+    if not text:
+        text = _xml10_filter(text)
+    return text
+    out = []
+    for ch in text:
+        code = ord(ch)
+        if code in (0x9, 0xA, 0xD):
+            out.append(ch); continue
+        if 0x20 <= code <= 0xD7FF:
+            out.append(ch); continue
+        if 0xE000 <= code <= 0xFFFD:
+            out.append(ch); continue
+        if 0x10000 <= code <= 0x10FFFF:
+            out.append(ch); continue
+        # drop invalid
+    return ''.join(out)
+
+
 def _sanitize_for_docx(text: str) -> str:
     """Remove characters that Word / python-docx (lxml) reject:
     - NULs and ASCII control chars except TAB/LF/CR
@@ -65,7 +115,8 @@ def _sanitize_for_docx(text: str) -> str:
     Also normalize stray surrogates by replacing with U+FFFD.
     """
     if not text:
-        return text
+        text = _xml10_filter(text)
+    return text
     import re, unicodedata
 
     # Remove ASCII controls except \t \n \r
@@ -87,6 +138,7 @@ def _sanitize_for_docx(text: str) -> str:
             out.append(ch)
         return ''.join(out)
     text = _drop_nonchars(text)
+    text = _xml10_filter(text)
     return text
 
 try:
@@ -99,6 +151,30 @@ except Exception:
     pass
 
 
+
+def _xml10_filter(text: str) -> str:
+    """Return text containing only XML 1.0 valid chars.
+    Allowed: #x9 | #xA | #xD | #x20–#xD7FF | #xE000–#xFFFD | #x10000–#x10FFFF
+    Everything else removed.
+    """
+    if not text:
+        text = _xml10_filter(text)
+    return text
+    out = []
+    for ch in text:
+        code = ord(ch)
+        if code in (0x9, 0xA, 0xD):
+            out.append(ch); continue
+        if 0x20 <= code <= 0xD7FF:
+            out.append(ch); continue
+        if 0xE000 <= code <= 0xFFFD:
+            out.append(ch); continue
+        if 0x10000 <= code <= 0x10FFFF:
+            out.append(ch); continue
+        # drop invalid
+    return ''.join(out)
+
+
 def _sanitize_for_docx(text: str) -> str:
     """Remove characters that Word / python-docx (lxml) reject:
     - NULs and ASCII control chars except TAB/LF/CR
@@ -106,7 +182,8 @@ def _sanitize_for_docx(text: str) -> str:
     Also normalize stray surrogates by replacing with U+FFFD.
     """
     if not text:
-        return text
+        text = _xml10_filter(text)
+    return text
     import re, unicodedata
 
     # Remove ASCII controls except \t \n \r
@@ -128,6 +205,7 @@ def _sanitize_for_docx(text: str) -> str:
             out.append(ch)
         return ''.join(out)
     text = _drop_nonchars(text)
+    text = _xml10_filter(text)
     return text
 
 def uk_to_us_quotes(text: str) -> str:
@@ -170,7 +248,7 @@ def pdf_bytes_to_docx_us(pdf_bytes: bytes) -> bytes:
     if text is None: text="[PDF extraction failed. Install pdfminer.six / PyPDF2 / PyMuPDF.]"
     text = uk_to_us_quotes(text)
     doc = Document()
-    for para in text.split("\n"): doc.add_paragraph(para)
+    for para in text.split("\n"): doc.add_paragraph(_xml10_filter(para))
     out = io.BytesIO(); doc.save(out); return out.getvalue()
 
 st.set_page_config(page_title="Quote Style Converter", page_icon="📝", layout="centered")
