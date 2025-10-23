@@ -1,4 +1,4 @@
-# quote_converter_app_pdf2docx_final_cleaned_fixedcss.py
+# quote_converter_app_pdf2docx_final_globclean.py
 import io, os, re, tempfile, streamlit as st
 
 try:
@@ -109,6 +109,16 @@ def convert_docx_bytes_to_us(docx_bytes: bytes) -> bytes:
     out = io.BytesIO(); doc.save(out)
     return out.getvalue()
 
+def _remove_global_shapes(doc: Document) -> None:
+    """Delete any drawing/pict/object/sym anywhere in the document XML."""
+    root = doc.part.element
+    # Collect a snapshot; we'll remove nodes from their parents
+    nodes = list(root.xpath('.//*[local-name()="drawing" or local-name()="pict" or local-name()="object" or local-name()="sym"]'))
+    for node in nodes:
+        parent = node.getparent()
+        if parent is not None:
+            parent.remove(node)
+
 def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
     if Document is None:
         raise RuntimeError("python-docx required.")
@@ -122,26 +132,34 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
         cv.convert(out_path, start=0, end=None)
         cv.close()
         doc = Document(out_path)
+
+        # 1) Remove all shapes globally (fixes the square artefact)
+        _remove_global_shapes(doc)
+
+        # 2) Clean runs and collapse page-join empties cautiously
         paras = doc.paragraphs
         for i, p in enumerate(paras):
             for r in p.runs:
-                r.text = (r.text.replace("\uFFFC","").replace("\u00A0"," ").replace("\u000c",""))
-                for dr in r._element.xpath(".//w:drawing"):
-                    dr.getparent().remove(dr)
+                if r.text:
+                    r.text = (r.text.replace("\uFFFC","")
+                                   .replace("\u00A0"," ")
+                                   .replace("\u000c",""))
             if p.text.strip() in {"", "\u00A0"} and 0 < i < len(paras)-1:
                 prev = paras[i-1].text.strip()
-                nxt = paras[i+1].text.strip()
+                nxt  = paras[i+1].text.strip()
                 if prev and nxt and not re.search(r'[.!?]"?$', prev):
                     p.text = ""
+
+        # 3) Normalize quotes to US
         convert_docx_runs_to_us(doc)
+
         buf = io.BytesIO(); doc.save(buf); return buf.getvalue()
 
-st.set_page_config(page_title="Quote Style Converter (Final Cleaned Fixed CSS)", page_icon="📝", layout="centered")
+st.set_page_config(page_title="Quote Style Converter (Global Clean)", page_icon="📝", layout="centered")
 
 CSS = """
 :root { --primary-color:#008080;--primary-hover:#006666;--bg-1:#0b0f14;--bg-2:#11161d;
---card:#0f141a;--text-1:#e8eef5;--text-2:#b2c0cf;--muted:#8aa0b5;--accent:#e0f2f1;
---ring:rgba(0,128,128,0.5);}
+--card:#0f141a;--text-1:#e8eef5;--text-2:#b2c0cf;--muted:#8aa0b5;--accent:#e0f2f1;--ring:rgba(0,128,128,0.5);}
 html,body,[data-testid="stAppViewContainer"]{
   background:linear-gradient(180deg,var(--bg-1),var(--bg-2))!important;
   color:var(--text-1)!important;
@@ -157,14 +175,14 @@ div.stButton>button{
 div.stButton>button:hover{background-color:var(--primary-hover);}
 body{font-family:Avenir,sans-serif;line-height:1.65;}
 """
+st.markdown("<style>\n"+CSS+"\n</style>", unsafe_allow_html=True)
 
-st.markdown("<style>\n"+CSS+"\n</style>",unsafe_allow_html=True)
-st.title("Quote Style Converter (pdf2docx Final Cleaned Fixed CSS)")
-st.caption("Layout-preserving PDF→DOCX and UK→US quote conversion with square cleanup and corrected CSS.")
+st.title("Quote Style Converter (pdf2docx – Global Clean)")
+st.caption("Layout-preserving PDF→DOCX with US quotes and global removal of page-join squares.")
 
 with st.container():
-    mode=st.radio("Choose input type",["DOCX → DOCX (UK → US)","PDF → DOCX (pdf2docx → US quotes)"])
-    uploaded=st.file_uploader("Upload file",type=["docx","pdf"])
+    mode = st.radio("Choose input type", ["DOCX → DOCX (UK → US)", "PDF → DOCX (pdf2docx → US quotes)"])
+    uploaded = st.file_uploader("Upload file", type=["docx","pdf"])
 
 if uploaded is not None:
     if mode.startswith("DOCX"):
@@ -172,20 +190,22 @@ if uploaded is not None:
             st.error("Please upload a .docx file for this mode.")
         elif st.button("Convert DOCX to US quotes"):
             try:
-                out_bytes=convert_docx_bytes_to_us(uploaded.read())
+                out_bytes = convert_docx_bytes_to_us(uploaded.read())
                 st.success("Converted. Download below.")
-                st.download_button("Download DOCX (US quotes)",out_bytes,
+                st.download_button("Download DOCX (US quotes)", out_bytes,
                     file_name=uploaded.name.rsplit(".",1)[0]+" (US Quotes).docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-            except Exception as e: st.error(f"Conversion failed: {e}")
+            except Exception as e:
+                st.error(f"Conversion failed: {e}")
     else:
         if not uploaded.name.lower().endswith(".pdf"):
             st.error("Please upload a .pdf file for this mode.")
         elif st.button("Convert PDF → DOCX (pdf2docx → US quotes)"):
             try:
-                out_bytes=pdf_bytes_to_docx_using_pdf2docx(uploaded.read())
+                out_bytes = pdf_bytes_to_docx_using_pdf2docx(uploaded.read())
                 st.success("Converted. Download below.")
-                st.download_button("Download DOCX (US quotes)",out_bytes,
+                st.download_button("Download DOCX (US quotes)", out_bytes,
                     file_name=uploaded.name.rsplit(".",1)[0]+" (US Quotes).docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-            except Exception as e: st.error(f"Conversion failed: {e}")
+            except Exception as e:
+                st.error(f"Conversion failed: {e}")
