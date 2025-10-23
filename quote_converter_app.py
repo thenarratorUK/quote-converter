@@ -1,9 +1,5 @@
-# quote_converter_app_pdf2docx.py
-import io
-import re
-import os
-import tempfile
-import streamlit as st
+# quote_converter_app_pdf2docx_final.py
+import io, os, re, tempfile, streamlit as st
 
 # ===== Dependencies =====
 try:
@@ -11,67 +7,50 @@ try:
 except Exception:
     Document = None
 
-# pdf2docx for layout-preserving PDF→DOCX
 try:
     from pdf2docx import Converter as PDF2DOCXConverter
 except Exception:
     PDF2DOCXConverter = None
 
-# ===== XML-safe sanitization =====
-_ASCII_CTRL = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')  # keep \t,\n,\r
+# ===== Sanitization =====
+_ASCII_CTRL = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')
 
 def _drop_nonchars(s: str) -> str:
-    out_chars = []
+    out = []
     for ch in s:
         code = ord(ch)
-        if 0xFDD0 <= code <= 0xFDEF:
-            continue
-        if (code & 0xFFFE) == 0xFFFE:
+        if 0xFDD0 <= code <= 0xFDEF or (code & 0xFFFE) == 0xFFFE:
             continue
         if 0xD800 <= code <= 0xDFFF:
-            out_chars.append('\uFFFD'); continue
-        out_chars.append(ch)
-    return ''.join(out_chars)
+            out.append('\uFFFD'); continue
+        out.append(ch)
+    return ''.join(out)
 
 def _xml10_filter(text: str) -> str:
     if not text:
         return text
-    out_chars = []
+    out = []
     for ch in text:
         code = ord(ch)
-        if code in (0x9, 0xA, 0xD):
-            out_chars.append(ch); continue
-        if 0x20 <= code <= 0xD7FF:
-            out_chars.append(ch); continue
-        if 0xE000 <= code <= 0xFFFD:
-            out_chars.append(ch); continue
-        if 0x10000 <= code <= 0x10FFFF:
-            out_chars.append(ch); continue
-    return ''.join(out_chars)
+        if code in (0x9, 0xA, 0xD) or 0x20 <= code <= 0xD7FF or 0xE000 <= code <= 0xFFFD or 0x10000 <= code <= 0x10FFFF:
+            out.append(ch)
+    return ''.join(out)
 
 def sanitize_for_docx(text: str) -> str:
     if not text:
         return text
     text = _ASCII_CTRL.sub('', text)
     text = _drop_nonchars(text)
-    text = _xml10_filter(text)
-    return text
+    return _xml10_filter(text)
 
-# ===== UK → US quotes conversion (placeholder-based) =====
-
+# ===== Smart Quote Normalization =====
 def _detect_primary_style(text: str) -> str:
-    """Heuristic: detect whether text is UK-primary (‘…’) or US-primary (“…”).
-    Returns "UK", "US", or "UNKNOWN".
-    """
     if not text:
         return "UNKNOWN"
-    # Count likely opening glyphs
     singles_open = len(re.findall(r'(^|[\s(\[{<])‘', text))
     doubles_open = len(re.findall(r'(^|[\s(\[{<])“', text))
-    # Also check frequency overall (ignore apostrophes between letters)
     singles_total = text.count("‘") + text.count("’")
     doubles_total = text.count("“") + text.count("”")
-    # Simple thresholds
     if singles_open >= doubles_open * 1.5 and singles_open >= 4:
         return "UK"
     if doubles_open >= singles_open * 1.2 and doubles_open >= 4:
@@ -82,92 +61,42 @@ def _detect_primary_style(text: str) -> str:
         return "UK"
     return "UNKNOWN"
 
-
 def normalize_quotes_to_us(text: str) -> str:
-    """Smart normalizer:
-       - Preserve apostrophes inside words.
-       - If text is already US-primary, do NOT flip it.
-       - If text is UK-primary, perform UK→US swap (placeholder-based).
-       - For straight quotes, 'smartify' them into US curly quotes using a simple state tracker.
-    """
     if not text:
         return text
-
-    # 0) Preserve apostrophes (straight or curly) inside words
     APOS = "<<APOS>>"
     text = re.sub(r"(?<=\w)[’'](?=\w)", APOS, text)
-
-    # 1) Decide if UK→US needed based on existing curly quotes
     style = _detect_primary_style(text)
-
-    # 2) If UK: perform UK→US using the robust placeholder method
     if style == "UK":
         OPEN_S, CLOSE_S, OPEN_D, CLOSE_D = "<<OPEN_S>>", "<<CLOSE_S>>", "<<OPEN_D>>", "<<CLOSE_D>>"
         t = (text.replace("‘", OPEN_S)
                  .replace("’", CLOSE_S)
                  .replace("“", OPEN_D)
                  .replace("”", CLOSE_D))
-        # Word-initial elisions and decades: map closing-single placeholders to apostrophes
-        # We'll just ensure we don't treat placeholders between letters as quotes
         t = re.sub(r'(?<=\w)'+re.escape(CLOSE_S)+r'(?=\w)', APOS, t)
         for w in ("em","cause","til","tis","twas","sup","round","clock"):
             t = re.sub(r'\b'+re.escape(CLOSE_S)+w+r'\b', APOS+w, t, flags=re.IGNORECASE)
         t = re.sub(re.escape(CLOSE_S)+r'(?=\d{2}s\b)', APOS, t)
-        # Swap
-        t = (t.replace(OPEN_S,"“")
-               .replace(CLOSE_S,"”")
-               .replace(OPEN_D,"‘")
-               .replace(CLOSE_D,"’"))
+        t = (t.replace(OPEN_S,"“").replace(CLOSE_S,"”").replace(OPEN_D,"‘").replace(CLOSE_D,"’"))
         text = t
     else:
-        # 3) If US or UNKNOWN: do NOT flip curly quotes.
-        # Instead, smarten any remaining straight quotes "..." to US curly.
-        # Simple open/close state per line.
         def smarten_line(line: str) -> str:
-            out = []
-            open_d = True  # assume double-quote starts as opening
-            i = 0
-            while i < len(line):
-                ch = line[i]
+            out, open_d = [], True
+            for ch in line:
                 if ch == '"':
-                    out.append("“" if open_d else "”")
-                    open_d = not open_d
+                    out.append("“" if open_d else "”"); open_d = not open_d
                 elif ch == "'":
-                    # standalone straight apostrophe -> curly apostrophe
                     out.append("’")
                 else:
                     out.append(ch)
-                i += 1
             return "".join(out)
         text = "\n".join(smarten_line(ln) for ln in text.split("\n"))
+    return text.replace(APOS, "’")
 
-    # 4) Restore apostrophes
-    text = text.replace(APOS, "’")
-    return text
-
-
-def uk_to_us_quotes(text: str) -> str:
-    if not text:
-        return text
-    OPEN_S, CLOSE_S, OPEN_D, CLOSE_D, APOS = "<<OPEN_S>>", "<<CLOSE_S>>", "<<OPEN_D>>", "<<CLOSE_D>>", "<<APOS>>"
-    text = text.replace("'", "’").replace('"', '”')
-    text = (text.replace("‘", OPEN_S)
-                .replace("’", CLOSE_S)
-                .replace("“", OPEN_D)
-                .replace("”", CLOSE_D))
-    text = re.sub(r'(?<=\w)'+re.escape(CLOSE_S)+r'(?=\w)', APOS, text)
-    for w in ("em","cause","til","tis","twas","sup","round","clock"):
-        text = re.sub(r'\b'+re.escape(CLOSE_S)+w+r'\b', APOS+w, text, flags=re.IGNORECASE)
-    text = re.sub(re.escape(CLOSE_S)+r'(?=\d{2}s\b)', APOS, text)
-    text = (text.replace(OPEN_S,"“")
-                .replace(CLOSE_S,"”")
-                .replace(OPEN_D,"‘")
-                .replace(CLOSE_D,"’"))
-    return text.replace(APOS,"’")
-
+# ===== DOCX Helpers =====
 def convert_docx_runs_to_us(doc: Document) -> None:
-    # In-place conversion of all runs (paragraphs + tables)
-    for p in doc.paragraphs:
+    paras = doc.paragraphs
+    for i, p in enumerate(paras):
         for r in p.runs:
             r.text = normalize_quotes_to_us(sanitize_for_docx(r.text))
     for t in doc.tables:
@@ -179,21 +108,19 @@ def convert_docx_runs_to_us(doc: Document) -> None:
 
 def convert_docx_bytes_to_us(docx_bytes: bytes) -> bytes:
     if Document is None:
-        raise RuntimeError("python-docx is required. Add it to requirements.txt")
+        raise RuntimeError("python-docx required.")
     doc = Document(io.BytesIO(docx_bytes))
     convert_docx_runs_to_us(doc)
-    out = io.BytesIO()
-    doc.save(out)
+    out = io.BytesIO(); doc.save(out)
     return out.getvalue()
 
+# ===== PDF2DOCX Conversion =====
 def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
-    """Convert PDF→DOCX with pdf2docx (layout preserving), then post-process quotes to US."""
     if Document is None:
-        raise RuntimeError("python-docx is required. Add it to requirements.txt")
+        raise RuntimeError("python-docx required.")
     if PDF2DOCXConverter is None:
-        raise RuntimeError("pdf2docx is required for layout-preserving PDF conversion. Add it to requirements.txt")
+        raise RuntimeError("pdf2docx required.")
 
-    # pdf2docx requires filesystem paths
     with tempfile.TemporaryDirectory() as tmpd:
         pdf_path = os.path.join(tmpd, "in.pdf")
         out_path = os.path.join(tmpd, "out.docx")
@@ -204,17 +131,29 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
         cv.convert(out_path, start=0, end=None)
         cv.close()
 
-        # Open produced DOCX, normalize quotes
         doc = Document(out_path)
-        convert_docx_runs_to_us(doc)
 
-        # Write to memory
-        buf = io.BytesIO()
-        doc.save(buf)
+        # --- Clean pdf2docx artefacts ---
+        paras = doc.paragraphs
+        for i, p in enumerate(paras):
+            # Remove stray markers inside runs
+            for r in p.runs:
+                r.text = (r.text.replace("\uFFFC", "")
+                                 .replace("\u00A0", " ")
+                                 .replace("\u000c", ""))
+            # Remove likely page-join blanks only
+            if p.text.strip() in {"", "\u00A0"} and 0 < i < len(paras) - 1:
+                prev = paras[i-1].text.strip()
+                nxt = paras[i+1].text.strip()
+                if prev and nxt and not re.search(r'[.!?]"?$', prev):
+                    p.text = ""
+
+        convert_docx_runs_to_us(doc)
+        buf = io.BytesIO(); doc.save(buf)
         return buf.getvalue()
 
-# ===== UI =====
-st.set_page_config(page_title="Quote Style Converter (pdf2docx)", page_icon="📝", layout="centered")
+# ===== Streamlit UI =====
+st.set_page_config(page_title="Quote Style Converter (pdf2docx Final)", page_icon="📝", layout="centered")
 
 CSS = """
 :root { --primary-color: #008080; --primary-hover: #006666; --bg-1: #0b0f14; --bg-2: #11161d; --card: #0f141a; --text-1: #e8eef5; --text-2: #b2c0cf; --muted: #8aa0b5; --accent: #e0f2f1; --ring: rgba(0, 128, 128, 0.5); }
@@ -224,16 +163,11 @@ a { color: var(--accent) !important; }
 div.stButton > button { background-color: var(--primary-color); color: #e8eef5; border: none; border-radius: 0.6rem; padding: 0.6rem 1rem; }
 div.stButton > button:hover { background-color: var(--primary-hover); }
 body { font-family: Avenir, sans-serif; line-height: 1.65; }
-.kicker { text-transform: uppercase; letter-spacing: .1em; font-weight: 600; color: #9cc; }
-h1, h2, h3 { letter-spacing: .02em; }
-.pill { display: inline-block; padding: .2rem .6rem; border: 1px solid rgba(255,255,255,.2); border-radius: 999px; font-size: .85rem; color: #e8eef5; }
-.muted { color: #b2c0cf; }
-.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 """
 st.markdown("<style>\n" + CSS + "\n</style>", unsafe_allow_html=True)
 
-st.title("Quote Style Converter (pdf2docx)")
-st.caption("DOCX (UK→US) and PDF→DOCX (layout-preserving via pdf2docx) with US quote normalization.")
+st.title("Quote Style Converter (pdf2docx Final)")
+st.caption("DOCX (UK→US) and PDF→DOCX (layout-preserving) with US quote normalization and page-join cleanup.")
 
 with st.container():
     st.markdown('<div class="card">', unsafe_allow_html=True)
