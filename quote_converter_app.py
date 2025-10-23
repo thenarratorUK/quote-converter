@@ -1,4 +1,4 @@
-# quote_converter_app_pdf2docx_final_globclean.py
+# quote_converter_app_pdf2docx_final_globclean_v2.py
 import io, os, re, tempfile, streamlit as st
 
 try:
@@ -101,6 +101,41 @@ def convert_docx_runs_to_us(doc: Document) -> None:
                     for r in p.runs:
                         r.text = normalize_quotes_to_us(sanitize_for_docx(r.text))
 
+def _remove_global_shapes_all_parts(doc: Document) -> None:
+    """
+    Delete drawing/pict/object/sym elements from the main document and all related parts
+    (headers/footers), then remove empty runs and paragraphs.
+    """
+    pkg = doc.part.package
+    # Iterate all parts in the .docx package
+    for part in pkg.parts:
+        elt = getattr(part, 'element', None)
+        if elt is None:
+            continue
+        # 1) Remove shapes/symbols globally in this part
+        nodes = list(elt.xpath('.//*[local-name()="drawing" or local-name()="pict" or local-name()="object" or local-name()="sym" or local-name()="txbxContent"]'))
+        for n in nodes:
+            parent = n.getparent()
+            if parent is not None:
+                parent.remove(n)
+        # 2) Remove empty runs <w:r> that have no text and no children
+        for r in list(elt.xpath('.//*[local-name()="r"]')):
+            has_text = bool(r.xpath('.//*[local-name()="t" and normalize-space(text())]'))
+            has_children = len(r) > 0
+            if not has_text and not has_children:
+                parent = r.getparent()
+                if parent is not None:
+                    parent.remove(r)
+        # 3) Remove paragraphs that are now empty or whitespace-only
+        for p in list(elt.xpath('.//*[local-name()="p"]')):
+            # If paragraph has any text node with non-space, keep
+            has_text = bool(p.xpath('.//*[local-name()="t" and normalize-space(text())]'))
+            has_draw = bool(p.xpath('.//*[local-name()="drawing" or local-name()="pict" or local-name()="object" or local-name()="sym"]'))
+            if not has_text and not has_draw:
+                parent = p.getparent()
+                if parent is not None:
+                    parent.remove(p)
+
 def convert_docx_bytes_to_us(docx_bytes: bytes) -> bytes:
     if Document is None:
         raise RuntimeError("python-docx required.")
@@ -108,16 +143,6 @@ def convert_docx_bytes_to_us(docx_bytes: bytes) -> bytes:
     convert_docx_runs_to_us(doc)
     out = io.BytesIO(); doc.save(out)
     return out.getvalue()
-
-def _remove_global_shapes(doc: Document) -> None:
-    """Delete any drawing/pict/object/sym anywhere in the document XML."""
-    root = doc.part.element
-    # Collect a snapshot; we'll remove nodes from their parents
-    nodes = list(root.xpath('.//*[local-name()="drawing" or local-name()="pict" or local-name()="object" or local-name()="sym"]'))
-    for node in nodes:
-        parent = node.getparent()
-        if parent is not None:
-            parent.remove(node)
 
 def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
     if Document is None:
@@ -133,10 +158,10 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
         cv.close()
         doc = Document(out_path)
 
-        # 1) Remove all shapes globally (fixes the square artefact)
-        _remove_global_shapes(doc)
+        # 1) Remove all shapes from all parts
+        _remove_global_shapes_all_parts(doc)
 
-        # 2) Clean runs and collapse page-join empties cautiously
+        # 2) Run-level cleanup in main doc
         paras = doc.paragraphs
         for i, p in enumerate(paras):
             for r in p.runs:
@@ -144,6 +169,7 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
                     r.text = (r.text.replace("\uFFFC","")
                                    .replace("\u00A0"," ")
                                    .replace("\u000c",""))
+            # Page-join mid-sentence blank removal
             if p.text.strip() in {"", "\u00A0"} and 0 < i < len(paras)-1:
                 prev = paras[i-1].text.strip()
                 nxt  = paras[i+1].text.strip()
@@ -155,7 +181,7 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
 
         buf = io.BytesIO(); doc.save(buf); return buf.getvalue()
 
-st.set_page_config(page_title="Quote Style Converter (Global Clean)", page_icon="📝", layout="centered")
+st.set_page_config(page_title="Quote Style Converter (Global Clean v2)", page_icon="📝", layout="centered")
 
 CSS = """
 :root { --primary-color:#008080;--primary-hover:#006666;--bg-1:#0b0f14;--bg-2:#11161d;
@@ -177,8 +203,8 @@ body{font-family:Avenir,sans-serif;line-height:1.65;}
 """
 st.markdown("<style>\n"+CSS+"\n</style>", unsafe_allow_html=True)
 
-st.title("Quote Style Converter (pdf2docx – Global Clean)")
-st.caption("Layout-preserving PDF→DOCX with US quotes and global removal of page-join squares.")
+st.title("Quote Style Converter (pdf2docx – Global Clean v2)")
+st.caption("Layout-preserving PDF→DOCX with US quotes and *deep* removal of page-join squares.")
 
 with st.container():
     mode = st.radio("Choose input type", ["DOCX → DOCX (UK → US)", "PDF → DOCX (pdf2docx → US quotes)"])
