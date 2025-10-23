@@ -3,3 +3,4 @@ python-docx
 pdfminer.six
 PyPDF2
 pymupdf
+pdf2docx
