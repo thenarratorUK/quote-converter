@@ -1,4 +1,4 @@
-# quote_converter_app.py
+# quote_converter_app_fixed.py
 import io, re, streamlit as st
 
 # Try import docx
@@ -37,13 +37,20 @@ except Exception:
 def uk_to_us_quotes(text: str) -> str:
     if not text: return text
     OPEN_S, CLOSE_S, OPEN_D, CLOSE_D, APOS = "<<OPEN_S>>", "<<CLOSE_S>>", "<<OPEN_D>>", "<<CLOSE_D>>", "<<APOS>>"
+    # Normalize straight quotes to curly for consistency
     text = text.replace("'", "’").replace('"', '”')
+    # Tokenize curly quotes
     text = (text.replace("‘", OPEN_S).replace("’", CLOSE_S).replace("“", OPEN_D).replace("”", CLOSE_D))
+    # Apostrophes inside words
     text = re.sub(r"(?<=\w)"+re.escape(CLOSE_S)+r"(?=\w)", APOS, text)
+    # Word-initial elisions
     for w in ["em","cause","til","tis","twas","sup","round","clock"]:
         text = re.sub(r"\b"+re.escape(CLOSE_S)+w+r"\b", APOS+w, text, flags=re.IGNORECASE)
-    text = re.sub(re.escape(CLOSE_S)+r"(?=\d2s\b)", APOS, text)
+    # Decades ’90s
+    text = re.sub(re.escape(CLOSE_S)+r"(?=\d{2}s\b)", APOS, text)
+    # Swap single↔double (primary↔nested)
     text = (text.replace(OPEN_S,"“").replace(CLOSE_S,"”").replace(OPEN_D,"‘").replace(CLOSE_D,"’"))
+    # Restore apostrophes
     return text.replace(APOS,"’")
 
 def convert_docx_bytes_to_us(docx_bytes: bytes) -> bytes:
@@ -71,9 +78,9 @@ def pdf_bytes_to_docx_us(pdf_bytes: bytes) -> bytes:
     out = io.BytesIO(); doc.save(out); return out.getvalue()
 
 st.set_page_config(page_title="Quote Style Converter", page_icon="📝", layout="centered")
-st.markdown(f"""
-<style>
-:root { --primary-color: #008080; --primary-hover: #006666; --bg-1: #0b0f14; --bg-2: #11161d; --card: #0f141a; --text-1: #e8eef5; --text-2: #b2c0cf; --muted: #8aa0b5; --accent: #e0f2f1; --ring: rgba(0, 128, 128, 0.5); }
+
+# SAFE CSS EMBEDDING: no f-strings, no .format, just concatenation
+CSS = """:root { --primary-color: #008080; --primary-hover: #006666; --bg-1: #0b0f14; --bg-2: #11161d; --card: #0f141a; --text-1: #e8eef5; --text-2: #b2c0cf; --muted: #8aa0b5; --accent: #e0f2f1; --ring: rgba(0, 128, 128, 0.5); }
 html, body, [data-testid="stAppViewContainer"] { background: linear-gradient(180deg, var(--bg-1), var(--bg-2)) !important; color: var(--text-1) !important; }
 a { color: var(--accent) !important; }
 .card { background: var(--card); border: 1px solid rgba(255,255,255,.08); border-radius: 1rem; padding: 1rem 1.25rem; margin: 0.5rem 0 1.25rem 0; box-shadow: 0 10px 25px rgba(0,0,0,.25); }
@@ -84,9 +91,8 @@ body { font-family: Avenir, sans-serif; line-height: 1.65; }
 h1, h2, h3 { letter-spacing: .02em; }
 .pill { display: inline-block; padding: .2rem .6rem; border: 1px solid rgba(255,255,255,.2); border-radius: 999px; font-size: .85rem; color: #e8eef5; }
 .muted { color: #b2c0cf; }
-.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-</style>
-""", unsafe_allow_html=True)
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }"""
+st.markdown("<style>\n" + CSS + "\n</style>", unsafe_allow_html=True)
 
 st.title("Quote Style Converter")
 st.caption("Upload a DOCX (UK quotes) → DOCX (US quotes). Or upload a PDF → DOCX (US quotes).")
