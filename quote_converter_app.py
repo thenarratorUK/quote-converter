@@ -1,7 +1,6 @@
-# quote_converter_app_pdf2docx_final.py
+# quote_converter_app_pdf2docx_final_fixed.py
 import io, os, re, tempfile, streamlit as st
 
-# ===== Dependencies =====
 try:
     from docx import Document
 except Exception:
@@ -12,7 +11,6 @@ try:
 except Exception:
     PDF2DOCXConverter = None
 
-# ===== Sanitization =====
 _ASCII_CTRL = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')
 
 def _drop_nonchars(s: str) -> str:
@@ -43,7 +41,6 @@ def sanitize_for_docx(text: str) -> str:
     text = _drop_nonchars(text)
     return _xml10_filter(text)
 
-# ===== Smart Quote Normalization =====
 def _detect_primary_style(text: str) -> str:
     if not text:
         return "UNKNOWN"
@@ -93,10 +90,8 @@ def normalize_quotes_to_us(text: str) -> str:
         text = "\n".join(smarten_line(ln) for ln in text.split("\n"))
     return text.replace(APOS, "’")
 
-# ===== DOCX Helpers =====
 def convert_docx_runs_to_us(doc: Document) -> None:
-    paras = doc.paragraphs
-    for i, p in enumerate(paras):
+    for p in doc.paragraphs:
         for r in p.runs:
             r.text = normalize_quotes_to_us(sanitize_for_docx(r.text))
     for t in doc.tables:
@@ -114,66 +109,47 @@ def convert_docx_bytes_to_us(docx_bytes: bytes) -> bytes:
     out = io.BytesIO(); doc.save(out)
     return out.getvalue()
 
-# ===== PDF2DOCX Conversion =====
 def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
     if Document is None:
         raise RuntimeError("python-docx required.")
     if PDF2DOCXConverter is None:
         raise RuntimeError("pdf2docx required.")
-
     with tempfile.TemporaryDirectory() as tmpd:
         pdf_path = os.path.join(tmpd, "in.pdf")
         out_path = os.path.join(tmpd, "out.docx")
-        with open(pdf_path, "wb") as f:
-            f.write(pdf_bytes)
-
+        with open(pdf_path, "wb") as f: f.write(pdf_bytes)
         cv = PDF2DOCXConverter(pdf_path)
         cv.convert(out_path, start=0, end=None)
         cv.close()
-
         doc = Document(out_path)
-
-        # --- Clean pdf2docx artefacts ---
         paras = doc.paragraphs
         for i, p in enumerate(paras):
-            # Remove stray markers inside runs
+            # Remove stray markers in runs
             for r in p.runs:
-                r.text = (r.text.replace("\uFFFC", "")
-                                 .replace("\u00A0", " ")
-                                 .replace("\u000c", ""))
+                r.text = (r.text.replace("\uFFFC","").replace("\u00A0"," ").replace("\u000c",""))
+            # Remove invisible inline shapes (page-break placeholders)
+            for shape in p._element.xpath('.//w:drawing | .//w:pict'):
+                shape.getparent().remove(shape)
             # Remove likely page-join blanks only
-            if p.text.strip() in {"", "\u00A0"} and 0 < i < len(paras) - 1:
+            if p.text.strip() in {"", "\u00A0"} and 0 < i < len(paras)-1:
                 prev = paras[i-1].text.strip()
                 nxt = paras[i+1].text.strip()
                 if prev and nxt and not re.search(r'[.!?]"?$', prev):
                     p.text = ""
-
         convert_docx_runs_to_us(doc)
-        buf = io.BytesIO(); doc.save(buf)
-        return buf.getvalue()
+        buf = io.BytesIO(); doc.save(buf); return buf.getvalue()
 
-# ===== Streamlit UI =====
-st.set_page_config(page_title="Quote Style Converter (pdf2docx Final)", page_icon="📝", layout="centered")
-
-CSS = """
-:root { --primary-color: #008080; --primary-hover: #006666; --bg-1: #0b0f14; --bg-2: #11161d; --card: #0f141a; --text-1: #e8eef5; --text-2: #b2c0cf; --muted: #8aa0b5; --accent: #e0f2f1; --ring: rgba(0, 128, 128, 0.5); }
-html, body, [data-testid="stAppViewContainer"] { background: linear-gradient(180deg, var(--bg-1), var(--bg-2)) !important; color: var(--text-1) !important; }
-a { color: var(--accent) !important; }
-.card { background: var(--card); border: 1px solid rgba(255,255,255,.08); border-radius: 1rem; padding: 1rem 1.25rem; margin: 0.5rem 0 1.25rem 0; box-shadow: 0 10px 25px rgba(0,0,0,.25); }
-div.stButton > button { background-color: var(--primary-color); color: #e8eef5; border: none; border-radius: 0.6rem; padding: 0.6rem 1rem; }
-div.stButton > button:hover { background-color: var(--primary-hover); }
-body { font-family: Avenir, sans-serif; line-height: 1.65; }
-"""
-st.markdown("<style>\n" + CSS + "\n</style>", unsafe_allow_html=True)
-
-st.title("Quote Style Converter (pdf2docx Final)")
-st.caption("DOCX (UK→US) and PDF→DOCX (layout-preserving) with US quote normalization and page-join cleanup.")
+st.set_page_config(page_title="Quote Style Converter (Final Fixed)", page_icon="📝", layout="centered")
+CSS = """:root { --primary-color:#008080;--primary-hover:#006666;--bg-1:#0b0f14;--bg-2:#11161d;--card:#0f141a;--text-1:#e8eef5;--text-2:#b2c0cf;--muted:#8aa0b5;--accent:#e0f2f1;--ring:rgba(0,128,128,0.5);}html,body,[data-testid="stAppViewContainer"]{background:linear-gradient(180deg,var(--bg-1),var(--bg-2))!important;color:var(--text-1)!important;}a{color:var(--accent)!important;}div.stButton>button{background-color:var(--primary-color);color:#e8eef5;border:none;border-radius:.6rem;padding:.6rem 1rem;}div.stButton>button:hover{background-color:var(--primary-hover);}body{font-family:Avenir,sans-serif;line-height:1.65;}"""
+st.markdown("<style>\n"+CSS+"\n</style>",unsafe_allow_html=True)
+st.title("Quote Style Converter (pdf2docx Final Fixed)")
+st.caption("Layout-preserving PDF→DOCX and UK→US quote conversion with page-join cleanup.")
 
 with st.container():
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    mode = st.radio("Choose input type", ["DOCX → DOCX (UK → US)", "PDF → DOCX (pdf2docx → US quotes)"])
-    uploaded = st.file_uploader("Upload file", type=["docx","pdf"])
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card">',unsafe_allow_html=True)
+    mode=st.radio("Choose input type",["DOCX → DOCX (UK → US)","PDF → DOCX (pdf2docx → US quotes)"])
+    uploaded=st.file_uploader("Upload file",type=["docx","pdf"])
+    st.markdown('</div>',unsafe_allow_html=True)
 
 if uploaded is not None:
     if mode.startswith("DOCX"):
@@ -181,22 +157,20 @@ if uploaded is not None:
             st.error("Please upload a .docx file for this mode.")
         elif st.button("Convert DOCX to US quotes"):
             try:
-                out_bytes = convert_docx_bytes_to_us(uploaded.read())
+                out_bytes=convert_docx_bytes_to_us(uploaded.read())
                 st.success("Converted. Download below.")
-                st.download_button("Download DOCX (US quotes)", out_bytes,
+                st.download_button("Download DOCX (US quotes)",out_bytes,
                     file_name=uploaded.name.rsplit(".",1)[0]+" (US Quotes).docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-            except Exception as e:
-                st.error(f"Conversion failed: {e}")
+            except Exception as e: st.error(f"Conversion failed: {e}")
     else:
         if not uploaded.name.lower().endswith(".pdf"):
             st.error("Please upload a .pdf file for this mode.")
         elif st.button("Convert PDF → DOCX (pdf2docx → US quotes)"):
             try:
-                out_bytes = pdf_bytes_to_docx_using_pdf2docx(uploaded.read())
+                out_bytes=pdf_bytes_to_docx_using_pdf2docx(uploaded.read())
                 st.success("Converted. Download below.")
-                st.download_button("Download DOCX (US quotes)", out_bytes,
+                st.download_button("Download DOCX (US quotes)",out_bytes,
                     file_name=uploaded.name.rsplit(".",1)[0]+" (US Quotes).docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-            except Exception as e:
-                st.error(f"Conversion failed: {e}")
+            except Exception as e: st.error(f"Conversion failed: {e}")
