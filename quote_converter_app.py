@@ -16,6 +16,38 @@ try:
 except Exception:
     pass
 
+
+def _sanitize_for_docx(text: str) -> str:
+    """Remove characters that Word / python-docx (lxml) reject:
+    - NULs and ASCII control chars except TAB/LF/CR
+    - Unicode noncharacters (U+FDD0–U+FDEF and any U+xxFFFE / U+xxFFFF)
+    Also normalize stray surrogates by replacing with U+FFFD.
+    """
+    if not text:
+        return text
+    import re, unicodedata
+
+    # Remove ASCII controls except \t \n \r
+    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
+
+    # Remove Unicode noncharacters
+    def _drop_nonchars(s):
+        out = []
+        for ch in s:
+            code = ord(ch)
+            if 0xFDD0 <= code <= 0xFDEF:  # noncharacters
+                continue
+            if (code & 0xFFFE) == 0xFFFE:  # ...FFFE / ...FFFF at any plane
+                continue
+            # Replace unpaired surrogates defensively
+            if 0xD800 <= code <= 0xDFFF:
+                out.append('\uFFFD')
+                continue
+            out.append(ch)
+        return ''.join(out)
+    text = _drop_nonchars(text)
+    return text
+
 try:
     import PyPDF2
     def _extract_pdf_pypdf2(data: bytes) -> str:
@@ -25,6 +57,38 @@ try:
 except Exception:
     pass
 
+
+def _sanitize_for_docx(text: str) -> str:
+    """Remove characters that Word / python-docx (lxml) reject:
+    - NULs and ASCII control chars except TAB/LF/CR
+    - Unicode noncharacters (U+FDD0–U+FDEF and any U+xxFFFE / U+xxFFFF)
+    Also normalize stray surrogates by replacing with U+FFFD.
+    """
+    if not text:
+        return text
+    import re, unicodedata
+
+    # Remove ASCII controls except \t \n \r
+    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
+
+    # Remove Unicode noncharacters
+    def _drop_nonchars(s):
+        out = []
+        for ch in s:
+            code = ord(ch)
+            if 0xFDD0 <= code <= 0xFDEF:  # noncharacters
+                continue
+            if (code & 0xFFFE) == 0xFFFE:  # ...FFFE / ...FFFF at any plane
+                continue
+            # Replace unpaired surrogates defensively
+            if 0xD800 <= code <= 0xDFFF:
+                out.append('\uFFFD')
+                continue
+            out.append(ch)
+        return ''.join(out)
+    text = _drop_nonchars(text)
+    return text
+
 try:
     import fitz  # PyMuPDF
     def _extract_pdf_pymupdf(data: bytes) -> str:
@@ -33,6 +97,38 @@ try:
     _pdf_extractors.append(("PyMuPDF", _extract_pdf_pymupdf))
 except Exception:
     pass
+
+
+def _sanitize_for_docx(text: str) -> str:
+    """Remove characters that Word / python-docx (lxml) reject:
+    - NULs and ASCII control chars except TAB/LF/CR
+    - Unicode noncharacters (U+FDD0–U+FDEF and any U+xxFFFE / U+xxFFFF)
+    Also normalize stray surrogates by replacing with U+FFFD.
+    """
+    if not text:
+        return text
+    import re, unicodedata
+
+    # Remove ASCII controls except \t \n \r
+    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
+
+    # Remove Unicode noncharacters
+    def _drop_nonchars(s):
+        out = []
+        for ch in s:
+            code = ord(ch)
+            if 0xFDD0 <= code <= 0xFDEF:  # noncharacters
+                continue
+            if (code & 0xFFFE) == 0xFFFE:  # ...FFFE / ...FFFF at any plane
+                continue
+            # Replace unpaired surrogates defensively
+            if 0xD800 <= code <= 0xDFFF:
+                out.append('\uFFFD')
+                continue
+            out.append(ch)
+        return ''.join(out)
+    text = _drop_nonchars(text)
+    return text
 
 def uk_to_us_quotes(text: str) -> str:
     if not text: return text
