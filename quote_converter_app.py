@@ -1,4 +1,4 @@
-# quote_converter_app_pdf2docx_final_fixed.py
+# quote_converter_app_pdf2docx_final_cleaned.py
 import io, os, re, tempfile, streamlit as st
 
 try:
@@ -127,9 +127,9 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
             # Remove stray markers in runs
             for r in p.runs:
                 r.text = (r.text.replace("\uFFFC","").replace("\u00A0"," ").replace("\u000c",""))
-            # Remove invisible inline shapes (page-break placeholders)
-            for shape in p._element.xpath('.//w:drawing | .//w:pict'):
-                shape.getparent().remove(shape)
+                # Remove invisible inline drawings inside runs (the real 'square')
+                for dr in r._element.xpath(".//w:drawing"):
+                    dr.getparent().remove(dr)
             # Remove likely page-join blanks only
             if p.text.strip() in {"", "\u00A0"} and 0 < i < len(paras)-1:
                 prev = paras[i-1].text.strip()
@@ -139,11 +139,11 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
         convert_docx_runs_to_us(doc)
         buf = io.BytesIO(); doc.save(buf); return buf.getvalue()
 
-st.set_page_config(page_title="Quote Style Converter (Final Fixed)", page_icon="📝", layout="centered")
-CSS = """:root { --primary-color:#008080;--primary-hover:#006666;--bg-1:#0b0f14;--bg-2:#11161d;--card:#0f141a;--text-1:#e8eef5;--text-2:#b2c0cf;--muted:#8aa0b5;--accent:#e0f2f1;--ring:rgba(0,128,128,0.5);}html,body,[data-testid="stAppViewContainer"]{background:linear-gradient(180deg,var(--bg-1),var(--bg-2))!important;color:var(--text-1)!important;}a{color:var(--accent)!important;}div.stButton>button{background-color:var(--primary-color);color:#e8eef5;border:none;border-radius:.6rem;padding:.6rem 1rem;}div.stButton>button:hover{background-color:var(--primary-hover);}body{font-family:Avenir,sans-serif;line-height:1.65;}"""
+st.set_page_config(page_title="Quote Style Converter (Final Cleaned)", page_icon="📝", layout="centered")
+CSS = """:root { --primary-color:#008080;--primary-hover:#006666;--bg-1:#0b0f14;--bg-2:#11161d;--card:#0f141a;--text-1:#e8eef5;--text-2:#b2c0cf;--muted:#8aa0b5;--accent:#e0f2f1;--ring:rgba(0,128,128,0.5);}html,body,[data-testid="stAppViewContainer"]{background:linear-gradient(180deg,var(--bg-1),var(--bg-2))!important;color:var(--text-1)!important;}a{color:var(--accent)!important;}div.stButton>button{background-color:var(--primary-color);color:#e8eef5;border:none;border-radius:.6rem;padding:.6rem 1rem;}div.stButton>button:hover{bac...
 st.markdown("<style>\n"+CSS+"\n</style>",unsafe_allow_html=True)
-st.title("Quote Style Converter (pdf2docx Final Fixed)")
-st.caption("Layout-preserving PDF→DOCX and UK→US quote conversion with page-join cleanup.")
+st.title("Quote Style Converter (pdf2docx Final Cleaned)")
+st.caption("Layout-preserving PDF→DOCX and UK→US quote conversion with full square cleanup.")
 
 with st.container():
     st.markdown('<div class="card">',unsafe_allow_html=True)
