@@ -1,5 +1,9 @@
 import io, os, re, tempfile, streamlit as st
 
+# Regex to remove ASCII control characters
+_ASCII_CTRL = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')
+
+
 try:
     from docx import Document
 except Exception:
