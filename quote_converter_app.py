@@ -1,4 +1,3 @@
-# quote_converter_app_pdf2docx_final_globclean_v3.py
 import io, os, re, tempfile, streamlit as st
 
 try:
@@ -11,9 +10,8 @@ try:
 except Exception:
     PDF2DOCXConverter = None
 
-
-
-def _run_size_pt(run, para, default=11.0):
+# === Drop-cap heuristic (strict, size-based) ===
+def _dc_run_size_pt(run, para, default=11.0):
     def _pt(x):
         try:
             return float(x.pt) if hasattr(x, "pt") else (float(x) if x is not None else None)
@@ -30,20 +28,38 @@ def _run_size_pt(run, para, default=11.0):
         pass
     return default
 
-def _alpha_positions_with_sizes(paragraph):
+def _dc_alpha_positions_with_sizes(paragraph):
     for ri, run in enumerate(paragraph.runs):
         t = run.text or ""
         if not t:
             continue
-        size = _run_size_pt(run, paragraph)
+        size = _dc_run_size_pt(run, paragraph)
         for ci, ch in enumerate(t):
             if ch.isalpha():
                 yield ri, ci, ch, size
 
+def _dc_first_alpha(paragraph):
+    for item in _dc_alpha_positions_with_sizes(paragraph):
+        return item
+    return None
+
+def _dc_next_alpha_in_flow(paragraphs, start_para_idx, start_pos):
+    # Search within the same paragraph after the given (ri, ci), then across following paragraphs
+    p = paragraphs[start_para_idx]
+    ri0, ci0 = start_pos
+    for ri, ci, ch, sz in _dc_alpha_positions_with_sizes(p):
+        if (ri > ri0) or (ri == ri0 and ci > ci0):
+            return ch, sz, start_para_idx
+    for j in range(start_para_idx + 1, len(paragraphs)):
+        for ri, ci, ch, sz in _dc_alpha_positions_with_sizes(paragraphs[j]):
+            return ch, sz, j
+    return None, None, None
+
 def fix_dropcap_reordering_strict(doc):
     """
-    Same ABCDEFG -> AE C G reordering as fix_dropcap_reordering, but guarded by a font-size check:
-    Only trigger when the *first alphabetic char in the initial paragraph* is >= 1.5× the size of the *next* alphabetic char in the document flow.
+    Detect A (first alpha glyph) as a true drop cap only if its size >= 1.5× the next alpha glyph size.
+    If pattern ABCDEFG is present across paragraphs, rewrite to AE C G (A concatenated to E; E, C, G separated by spaces).
+    The heuristic collapses the affected paragraphs into a single paragraph and avoids UI changes.
     """
     paras = list(doc.paragraphs)
     i = 0
@@ -51,99 +67,51 @@ def fix_dropcap_reordering_strict(doc):
         p = paras[i]
         t = p.text or ""
 
-        # Identify the first alphabetic char position in paragraph i and its size
-        first_alpha = None
-        for ri, ci, ch, sz in _alpha_positions_with_sizes(p):
-            first_alpha = (ri, ci, ch, sz)
-            break
-        if first_alpha is None:
-            i += 1
-            continue
+        first = _dc_first_alpha(p)
+        if first is None:
+            i += 1; continue
+        ri0, ci0, Achar, Asz = first
 
-        ri0, ci0, Achar, Asz = first_alpha
+        # find next alpha glyph size in document flow
+        Bchar, Bsz, _ = _dc_next_alpha_in_flow(paras, i, (ri0, ci0))
+        if Bsz is None or Asz < 1.5 * Bsz:
+            i += 1; continue
 
-        # Gather the next alphabetic char in the *document flow* (same paragraph after A, or subsequent paragraphs)
-        next_alpha = None
-        # First: same paragraph, after ci0
-        for ri, ci, ch, sz in _alpha_positions_with_sizes(p):
-            if (ri > ri0) or (ri == ri0 and ci > ci0):
-                next_alpha = (ri, ci, ch, sz)
-                break
-        # If not found, look ahead across following paragraphs
-        if next_alpha is None:
-            for j in range(i + 1, len(paras)):
-                for ri, ci, ch, sz in _alpha_positions_with_sizes(paras[j]):
-                    next_alpha = (ri, ci, ch, sz)
-                    break
-                if next_alpha is not None:
-                    break
-        if next_alpha is None:
-            i += 1
-            continue
-
-        _, _, _, Bsz = next_alpha
-
-        # Size guard: A must be >= 1.5× B to qualify
-        if Asz < 1.5 * Bsz:
-            i += 1
-            continue
-
-        # Validate local paragraph layout: paragraph i should begin with A + space + rest-of-line (C)
-        # We won't rely only on regex; we reconstruct C by slicing text from the first visible non-space char after A
-        # However, to avoid being too invasive, require that the very first visible glyph is Achar and a following space exists nearby.
-        starts_ok = False
-        visible_seen = 0
-        for ch in (p.text or ""):
-            if not ch.isspace():
-                visible_seen += 1
-                if visible_seen == 1 and ch == Achar:
-                    starts_ok = True
-                break
-        if not starts_ok:
-            i += 1
-            continue
-
-        # Extract C string: from the first non-space char after the *first visible run char* (not strictly after ci0, but good-enough for split shapes)
-        # We'll parse as: leading single glyph + optional spaces + remainder -> C
-        mt = re.match(r'^([^\S\r\n]*)([A-Za-z])( +)(.+)$', p.text or "")
+        # We expect paragraph i to effectively start with A then spaces then rest (C)
+        # Extract C conservatively with a simple pattern on the paragraph's visible text
+        mt = re.match(r'^[\s]*([A-Za-z])( +)(.+)$', t)
         if not mt:
-            i += 1
-            continue
-        # groups: lead_ws, A, space, C
-        C = mt.group(4).strip()
+            i += 1; continue
+        C = mt.group(3).strip()
 
-        # Detect gap D: one or more empty paragraphs immediately following
+        # Detect gap D: one or more empty paragraphs after i
         j = i + 1
         had_gap = False
         while j < len(paras) and (paras[j].text or "").strip() == "":
             had_gap = True
             j += 1
         if not had_gap or j >= len(paras):
-            i += 1
-            continue
+            i += 1; continue
 
-        # E = first non-empty after the gap
         E = (paras[j].text or "").strip()
 
-        # G = next non-empty after E (skip any additional empties)
+        # Next non-empty after E is G
         k = j + 1
         while k < len(paras) and (paras[k].text or "").strip() == "":
             k += 1
         if k >= len(paras):
-            i += 1
-            continue
+            i += 1; continue
         G = (paras[k].text or "").strip()
 
-        # Construct AE C G (no space between A and E)
+        # Build AE C G (no space between A and E)
         new_text = (Achar.upper() + E).strip()
         if C:
             new_text += " " + C
         if G:
             new_text += " " + G
 
-        # Replace paragraphs i..k with a single paragraph containing new_text
+        # Replace paragraph i text, then remove paragraphs i+1..k at XML level
         p.text = new_text
-        # Remove paras i+1..k at XML level
         for _ in range(k - i):
             try:
                 nxt = p._element.getnext()
@@ -152,98 +120,12 @@ def fix_dropcap_reordering_strict(doc):
             except Exception:
                 break
 
+        # refresh snapshot after structural change
         paras = list(doc.paragraphs)
         i += 1
 
     return doc
-
-def fix_dropcap_reordering_strict(doc):
-    """
-    Heuristic for PDF->DOCX line misordering caused by drop caps.
-    Pattern described by user:
-      A = single larger letter (captured in first paragraph as a single letter + space prefix)
-      B = space after it
-      C = following text (continuation of first paragraph after "A ")
-      D = a gap (one or more empty paragraphs)
-      E = the sentence that actually belongs immediately after the drop cap
-      F = a newline / next line break (typically next paragraph)
-      G = the following line
-    Transform:
-      ABCDEFG  ->  A+E + " " + C + " " + G
-    Implementation assumptions:
-      - A and C are in paragraph i, with text starting "^[A-Za-z]\\s+..."
-      - D are one or more empty paragraphs i+1..j-1
-      - E is the first non-empty paragraph at index j
-      - G is the first non-empty paragraph at index k > j (skipping any further empty paragraphs)
-    The function replaces paragraphs [i..k] with a single paragraph "AE C G".
-    """
-    paras = list(doc.paragraphs)
-    i = 0
-    while i < len(paras):
-        p = paras[i]
-        t = p.text or ""
-        m = re.match(r'^([A-Za-z])\s+(.+)$', t)
-        if not m:
-            i += 1
-            continue
-
-        A = m.group(1)
-        C = m.group(2).strip()
-
-        # Find first non-empty paragraph after optional gap(s)
-        j = i + 1
-        had_gap = False
-        while j < len(paras) and (paras[j].text or "").strip() == "":
-            had_gap = True
-            j += 1
-
-        if j >= len(paras):
-            i += 1
-            continue
-
-        E = (paras[j].text or "").strip()
-
-        # Find next non-empty after E (skip additional gaps)
-        k = j + 1
-        while k < len(paras) and (paras[k].text or "").strip() == "":
-            k += 1
-        if k >= len(paras):
-            i += 1
-            continue
-
-        G = (paras[k].text or "").strip()
-
-        # We only apply if we actually observed a gap D; this reduces false positives
-        if not had_gap:
-            i += 1
-            continue
-
-        # Construct new paragraph text
-        new_text = (A + E).strip()  # AE, no space between A and E
-        if C:
-            new_text += " " + C
-        if G:
-            new_text += " " + G
-
-        # Replace paragraphs i..k with a single paragraph containing new_text
-        p.text = new_text
-        # Remove paragraphs i+1..k from the document
-        for _ in range(k - i):
-            # Note: python-docx requires removing from the underlying XML
-            # We'll remove the next sibling paragraph element
-            try:
-                nxt = p._element.getnext()
-                if nxt is not None:
-                    p._element.getparent().remove(nxt)
-            except Exception:
-                break
-
-        # Refresh local reference to paragraphs by re-snapshotting (structure changed)
-        paras = list(doc.paragraphs)
-        # Move past the modified paragraph
-        i += 1
-
-    return doc
+# === end drop-cap heuristic ===
 
 
 
@@ -420,55 +302,132 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
 
 st.set_page_config(page_title="Quote Style Converter (Global Clean v3)", page_icon="📝", layout="centered")
 
-CSS = """
-:root { --primary-color:#008080;--primary-hover:#006666;--bg-1:#0b0f14;--bg-2:#11161d;
---card:#0f141a;--text-1:#e8eef5;--text-2:#b2c0cf;--muted:#8aa0b5;--accent:#e0f2f1;--ring:rgba(0,128,128,0.5);}
-html,body,[data-testid="stAppViewContainer"]{
-  background:linear-gradient(180deg,var(--bg-1),var(--bg-2))!important;
-  color:var(--text-1)!important;
+CSS = """:root {
+  --primary-color: #008080;      /* Teal */
+  --primary-hover: #007070;
+  --background-color: #fdfdfd;
+  --text-color: #222222;
+  --card-background: #ffffff;
+  --card-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
+  --border-radius: 10px;
+  --font-family: 'Avenir', sans-serif;
+  --accent-color: #ff9900;
 }
-a{color:var(--accent)!important;}
-div.stButton>button{
-  background-color:var(--primary-color);
-  color:#e8eef5;
-  border:none;
-  border-radius:.6rem;
-  padding:.6rem 1rem;
+
+/* Global Styles */
+body {
+  background-color: var(--background-color);
+  font-family: var(--font-family);
+  color: var(--text-color);
+  margin: 0;
+  padding: 0;
 }
-div.stButton>button:hover{background-color:var(--primary-hover);}
-body{font-family:Avenir,sans-serif;line-height:1.65;}
+
+h1, h2, h3, h4, h5, h6 {
+  color: var(--text-color);
+  font-weight: 700;
+  margin-bottom: 0.5em;
+}
+
+/* Button Styles */
+div.stButton > button {
+  background-color: var(--primary-color);
+  color: #ffffff;
+  border: none;
+  padding: 0.75em 1.25em;
+  border-radius: var(--border-radius);
+  cursor: pointer;
+  transition: background-color 0.3s ease, transform 0.2s;
+}
+
+div.stButton > button:hover {
+  background-color: var(--primary-hover);
+  transform: translateY(-2px);
+}
+
+/* Card/Container Styling */
+.custom-container {
+  background: var(--card-background);
+  padding: 2em;
+  border-radius: var(--border-radius);
+  box-shadow: var(--card-shadow);
+  margin-bottom: 2em;
+}
+
+.css-1d391kg {
+  background: var(--card-background);
+  padding: 1em;
+  border-radius: var(--border-radius);
+  box-shadow: var(--card-shadow);
+}
+
+/* Form Element Styling */
+input, select, textarea {
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  padding: 0.5em;
+  font-size: 1em;
+}
+
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: var(--primary-color);
+  box-shadow: 0 0 5px rgba(0, 128, 128, 0.3);
+}
+
+/* Enforce font in uploader */
+.stFileUploader, .stFileUploader label, .stFileUploader div, .stFileUploader button, .stFileUploader *,
+[data-testid="stFileUploader"], [data-testid="stFileUploader"] *, [data-testid="stFileUploadDropzone"], [data-testid="stFileUploadDropzone"] *,
+input[type="file"] {
+  font-family: var(--font-family) !important;
+}
+
 """
 st.markdown("<style>\n"+CSS+"\n</style>", unsafe_allow_html=True)
 
-st.title("Quote Style Converter (pdf2docx – Global Clean v3)")
-st.caption("Layout-preserving PDF→DOCX with US quotes and deepest cleanup of page-join squares.")
+st.title("UK to US Quote Converter with Optional PDF to DOCX Conversion")
+st.write("Please upload a docx using single-quotes dialogue for conversion to double-quotes dialogue, or upload a PDF of either type for conversion to double-quotes dialogue in a docx.")
 
-with st.container():
-    mode = st.radio("Choose input type", ["DOCX → DOCX (UK → US)", "PDF → DOCX (pdf2docx → US quotes)"])
-    uploaded = st.file_uploader("Upload file", type=["docx","pdf"])
+uploaded = st.file_uploader(
+    "Upload DOCX (single-quotes) or PDF",
+    type=["docx", "pdf"],
+    accept_multiple_files=False,
+    key="file",
+    label_visibility="collapsed"
+)
+
+
 
 if uploaded is not None:
-    if mode.startswith("DOCX"):
-        if not uploaded.name.lower().endswith(".docx"):
-            st.error("Please upload a .docx file for this mode.")
-        elif st.button("Convert DOCX to US quotes"):
-            try:
-                out_bytes = convert_docx_bytes_to_us(uploaded.read())
-                st.success("Converted. Download below.")
-                st.download_button("Download DOCX (US quotes)", out_bytes,
-                    file_name=uploaded.name.rsplit(".",1)[0]+" (US Quotes).docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-            except Exception as e:
-                st.error(f"Conversion failed: {e}")
-    else:
-        if not uploaded.name.lower().endswith(".pdf"):
-            st.error("Please upload a .pdf file for this mode.")
-        elif st.button("Convert PDF → DOCX (pdf2docx → US quotes)"):
-            try:
-                out_bytes = pdf_bytes_to_docx_using_pdf2docx(uploaded.read())
-                st.success("Converted. Download below.")
-                st.download_button("Download DOCX (US quotes)", out_bytes,
-                    file_name=uploaded.name.rsplit(".",1)[0]+" (US Quotes).docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-            except Exception as e:
-                st.error(f"Conversion failed: {e}")
+    # Show a simple file summary and a Convert button
+    st.write(f"Selected file: **{uploaded.name}**")
+    if st.button("Convert"):
+        name_lower = uploaded.name.lower()
+        if name_lower.endswith(".docx"):
+            if Document is None:
+                st.error("python-docx not available; cannot process DOCX.")
+            else:
+                try:
+                    raw = uploaded.read()
+                    out_bytes = docx_bytes_to_us_quotes(raw) if 'docx_bytes_to_us_quotes' in globals() else convert_docx_bytes_to_us(raw)
+                    st.success("Converted. Download below.")
+                    st.download_button("Download File", out_bytes,
+                        file_name=uploaded.name,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                except Exception as e:
+                    st.error(f"Conversion failed: {e}")
+        elif name_lower.endswith(".pdf"):
+            if PDF2DOCXConverter is None:
+                st.error("pdf2docx not available; cannot convert PDF to DOCX.")
+            else:
+                try:
+                    out_bytes = pdf_bytes_to_docx_using_pdf2docx(uploaded.read())
+                    st.success("Converted. Download below.")
+                    base = uploaded.name.rsplit(".",1)[0]
+                    st.download_button("Download File", out_bytes,
+                        file_name=base + ".docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                except Exception as e:
+                    st.error(f"Conversion failed: {e}")
+        else:
+            st.error("Unsupported file type. Please upload a .docx or .pdf.")
