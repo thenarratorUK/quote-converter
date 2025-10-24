@@ -1,3 +1,4 @@
+# quote_converter_app_pdf2docx_final_globclean_v3.py
 import io, os, re, tempfile, streamlit as st
 
 try:
@@ -9,6 +10,109 @@ try:
     from pdf2docx import Converter as PDF2DOCXConverter
 except Exception:
     PDF2DOCXConverter = None
+def _pt_value(val, fallback=None):
+    try:
+        if val is None:
+            return fallback
+        return float(val.pt) if hasattr(val, "pt") else float(val)
+    except Exception:
+        return fallback
+
+def _run_font_size_pt(run, para):
+    sz = _pt_value(getattr(run.font, "size", None))
+    if sz is not None:
+        return sz
+    try:
+        psz = _pt_value(para.style.font.size)
+        if psz is not None:
+            return psz
+    except Exception:
+        pass
+    return 11.0
+
+def _iter_alpha_chars(paragraph):
+    for ri, run in enumerate(paragraph.runs):
+        t = run.text or ""
+        if not t:
+            continue
+        size_pt = _run_font_size_pt(run, paragraph)
+        for ci, ch in enumerate(t):
+            if ch.isalpha():
+                yield ri, ci, ch, size_pt
+
+def _majority_font_size_pt(doc) -> float:
+    sizes = []
+    for p in doc.paragraphs:
+        for ri, ci, ch, sz in _iter_alpha_chars(p):
+            sizes.append(sz)
+    if not sizes:
+        return 11.0
+    try:
+        import statistics as _stats
+        return float(_stats.median(sizes))
+    except Exception:
+        return sum(sizes) / len(sizes)
+
+def _remove_char_from_run(paragraph, run_idx, char_idx):
+    run = paragraph.runs[run_idx]
+    t = run.text or ""
+    run.text = t[:char_idx] + t[char_idx+1:]
+
+def _first_nonspace_pos(paragraph):
+    for ri, run in enumerate(paragraph.runs):
+        t = run.text or ""
+        for ci, ch in enumerate(t):
+            if not ch.isspace():
+                return ri, ci
+    return None
+
+def _strip_leading_spaces(paragraph):
+    for ri, run in enumerate(paragraph.runs):
+        t = run.text or ""
+        if t.strip("") == "":
+            paragraph.runs[ri].text = ""
+        else:
+            paragraph.runs[ri].text = (t.lstrip() if t else t)
+            break
+
+def fix_drop_caps_in_docx(doc):
+    majority = _majority_font_size_pt(doc)
+    X = 1.5 * majority
+
+    for p in doc.paragraphs:
+        if not p.runs:
+            continue
+        chars = list(_iter_alpha_chars(p))
+        if not chars:
+            continue
+        for idx, (ri, ci, ch, sz) in enumerate(chars):
+            if sz < X:
+                continue
+            if not ch.isalpha():
+                continue
+            run_t = p.runs[ri].text or ""
+            visible = [c for c in run_t if not c.isspace()]
+            if len(visible) != 1:
+                continue
+            if idx + 1 < len(chars):
+                ri2, ci2, ch2, sz2 = chars[idx+1]
+            else:
+                continue
+            if sz2 < sz and sz2 < X:
+                _remove_char_from_run(p, ri, ci)
+                pos = _first_nonspace_pos(p)
+                cap = ch.upper()
+                if pos is None:
+                    p.add_run(cap)
+                else:
+                    r0_idx, c0_idx = pos
+                    r0 = p.runs[r0_idx]
+                    t0 = r0.text or ""
+                    _strip_leading_spaces(p)
+                    r0.text = cap + (t0.lstrip() if t0 else "")
+                break
+    return doc
+
 
 _ASCII_CTRL = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')
 
@@ -139,6 +243,7 @@ def convert_docx_bytes_to_us(docx_bytes: bytes) -> bytes:
     if Document is None:
         raise RuntimeError("python-docx required.")
     doc = Document(io.BytesIO(docx_bytes))
+    fix_drop_caps_in_docx(doc)
     convert_docx_runs_to_us(doc)
     out = io.BytesIO(); doc.save(out)
     return out.getvalue()
@@ -156,6 +261,7 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
         cv.convert(out_path, start=0, end=None)
         cv.close()
         doc = Document(out_path)
+        fix_drop_caps_in_docx(doc)
 
         # 1) Deep removal across all parts (fix persistent squares)
         _remove_global_shapes_all_parts(doc)
@@ -181,132 +287,55 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
 
 st.set_page_config(page_title="Quote Style Converter (Global Clean v3)", page_icon="📝", layout="centered")
 
-CSS = """:root {
-  --primary-color: #008080;      /* Teal */
-  --primary-hover: #007070;
-  --background-color: #fdfdfd;
-  --text-color: #222222;
-  --card-background: #ffffff;
-  --card-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
-  --border-radius: 10px;
-  --font-family: 'Avenir', sans-serif;
-  --accent-color: #ff9900;
+CSS = """
+:root { --primary-color:#008080;--primary-hover:#006666;--bg-1:#0b0f14;--bg-2:#11161d;
+--card:#0f141a;--text-1:#e8eef5;--text-2:#b2c0cf;--muted:#8aa0b5;--accent:#e0f2f1;--ring:rgba(0,128,128,0.5);}
+html,body,[data-testid="stAppViewContainer"]{
+  background:linear-gradient(180deg,var(--bg-1),var(--bg-2))!important;
+  color:var(--text-1)!important;
 }
-
-/* Global Styles */
-body {
-  background-color: var(--background-color);
-  font-family: var(--font-family);
-  color: var(--text-color);
-  margin: 0;
-  padding: 0;
+a{color:var(--accent)!important;}
+div.stButton>button{
+  background-color:var(--primary-color);
+  color:#e8eef5;
+  border:none;
+  border-radius:.6rem;
+  padding:.6rem 1rem;
 }
-
-h1, h2, h3, h4, h5, h6 {
-  color: var(--text-color);
-  font-weight: 700;
-  margin-bottom: 0.5em;
-}
-
-/* Button Styles */
-div.stButton > button {
-  background-color: var(--primary-color);
-  color: #ffffff;
-  border: none;
-  padding: 0.75em 1.25em;
-  border-radius: var(--border-radius);
-  cursor: pointer;
-  transition: background-color 0.3s ease, transform 0.2s;
-}
-
-div.stButton > button:hover {
-  background-color: var(--primary-hover);
-  transform: translateY(-2px);
-}
-
-/* Card/Container Styling */
-.custom-container {
-  background: var(--card-background);
-  padding: 2em;
-  border-radius: var(--border-radius);
-  box-shadow: var(--card-shadow);
-  margin-bottom: 2em;
-}
-
-.css-1d391kg {
-  background: var(--card-background);
-  padding: 1em;
-  border-radius: var(--border-radius);
-  box-shadow: var(--card-shadow);
-}
-
-/* Form Element Styling */
-input, select, textarea {
-  border: 1px solid #ddd;
-  border-radius: 4px;
-  padding: 0.5em;
-  font-size: 1em;
-}
-
-input:focus, select:focus, textarea:focus {
-  outline: none;
-  border-color: var(--primary-color);
-  box-shadow: 0 0 5px rgba(0, 128, 128, 0.3);
-}
-
-/* Enforce font in uploader */
-.stFileUploader, .stFileUploader label, .stFileUploader div, .stFileUploader button, .stFileUploader *,
-[data-testid="stFileUploader"], [data-testid="stFileUploader"] *, [data-testid="stFileUploadDropzone"], [data-testid="stFileUploadDropzone"] *,
-input[type="file"] {
-  font-family: var(--font-family) !important;
-}
-
+div.stButton>button:hover{background-color:var(--primary-hover);}
+body{font-family:Avenir,sans-serif;line-height:1.65;}
 """
 st.markdown("<style>\n"+CSS+"\n</style>", unsafe_allow_html=True)
 
-st.title("UK to US Quote Converter with Optional PDF to DOCX Conversion")
-st.write("Please upload a docx using single-quotes dialogue for conversion to double-quotes dialogue, or upload a PDF of either type for conversion to double-quotes dialogue in a docx.")
+st.title("Quote Style Converter (pdf2docx – Global Clean v3)")
+st.caption("Layout-preserving PDF→DOCX with US quotes and deepest cleanup of page-join squares.")
 
-uploaded = st.file_uploader(
-    "Upload DOCX (single-quotes) or PDF",
-    type=["docx", "pdf"],
-    accept_multiple_files=False,
-    key="file",
-    label_visibility="collapsed"
-)
-
-
+with st.container():
+    mode = st.radio("Choose input type", ["DOCX → DOCX (UK → US)", "PDF → DOCX (pdf2docx → US quotes)"])
+    uploaded = st.file_uploader("Upload file", type=["docx","pdf"])
 
 if uploaded is not None:
-    # Show a simple file summary and a Convert button
-    st.write(f"Selected file: **{uploaded.name}**")
-    if st.button("Convert"):
-        name_lower = uploaded.name.lower()
-        if name_lower.endswith(".docx"):
-            if Document is None:
-                st.error("python-docx not available; cannot process DOCX.")
-            else:
-                try:
-                    raw = uploaded.read()
-                    out_bytes = docx_bytes_to_us_quotes(raw) if 'docx_bytes_to_us_quotes' in globals() else convert_docx_bytes_to_us(raw)
-                    st.success("Converted. Download below.")
-                    st.download_button("Download File", out_bytes,
-                        file_name=uploaded.name,
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-                except Exception as e:
-                    st.error(f"Conversion failed: {e}")
-        elif name_lower.endswith(".pdf"):
-            if PDF2DOCXConverter is None:
-                st.error("pdf2docx not available; cannot convert PDF to DOCX.")
-            else:
-                try:
-                    out_bytes = pdf_bytes_to_docx_using_pdf2docx(uploaded.read())
-                    st.success("Converted. Download below.")
-                    base = uploaded.name.rsplit(".",1)[0]
-                    st.download_button("Download File", out_bytes,
-                        file_name=base + ".docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-                except Exception as e:
-                    st.error(f"Conversion failed: {e}")
-        else:
-            st.error("Unsupported file type. Please upload a .docx or .pdf.")
+    if mode.startswith("DOCX"):
+        if not uploaded.name.lower().endswith(".docx"):
+            st.error("Please upload a .docx file for this mode.")
+        elif st.button("Convert DOCX to US quotes"):
+            try:
+                out_bytes = convert_docx_bytes_to_us(uploaded.read())
+                st.success("Converted. Download below.")
+                st.download_button("Download DOCX (US quotes)", out_bytes,
+                    file_name=uploaded.name.rsplit(".",1)[0]+" (US Quotes).docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            except Exception as e:
+                st.error(f"Conversion failed: {e}")
+    else:
+        if not uploaded.name.lower().endswith(".pdf"):
+            st.error("Please upload a .pdf file for this mode.")
+        elif st.button("Convert PDF → DOCX (pdf2docx → US quotes)"):
+            try:
+                out_bytes = pdf_bytes_to_docx_using_pdf2docx(uploaded.read())
+                st.success("Converted. Download below.")
+                st.download_button("Download DOCX (US quotes)", out_bytes,
+                    file_name=uploaded.name.rsplit(".",1)[0]+" (US Quotes).docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            except Exception as e:
+                st.error(f"Conversion failed: {e}")
