@@ -51,105 +51,177 @@ def _dc_median(vals):
     except Exception:
         return sum(vals)/len(vals)
 
-def fix_dropcap_reorder_by_size(doc):
+def fix_all_dropcaps(doc):
     """
-    Robust multi-pass drop-cap reorder:
-      • For each paragraph, repeatedly detect and fix the A/C/D/E/G pattern until no more matches in that paragraph.
-      • Repeat over the entire document for up to MAX_DOC_PASSES, stopping early if a pass makes no changes.
+    Multi-pass drop-cap reorder:
+      - Repeats scanning and fixing until no further changes are made in the document (max 8 passes).
+      - Each pass scans every paragraph and applies the size-based A/E/C/G reconstruction where the pattern is found.
     """
-    MAX_DOC_PASSES = 6
-    for _ in range(MAX_DOC_PASSES):
-        doc_changes = 0
+    MAX_PASSES = 8
+    for _ in range(MAX_PASSES):
+        changes = 0
         for p in doc.paragraphs:
-            changed_para = True
-            # Repeat within the paragraph until no more patterns found (covers multiple drop caps in the same paragraph)
-            inner_guard = 0
-            while changed_para and inner_guard < 4:  # safety
-                inner_guard += 1
-                changed_para = False
+            runs = list(p.runs)
+            if not runs:
+                continue
 
-                runs = list(p.runs)
-                if not runs:
+            # Compute paragraph-level median size to adapt to local formatting
+            sizes = [ _dc_run_size_pt(r, p) for r in runs ]
+            median_sz = _dc_median(sizes)
+            threshold = 1.5 * median_sz
+
+            # Find candidate A
+            A_idx = None
+            A_char = None
+            for i, r in enumerate(runs):
+                t = r.text or ""
+                alpha_chars = [ch for ch in t if ch.isalpha()]
+                if len(alpha_chars) == 1 and sizes[i] is not None and sizes[i] >= threshold:
+                    A_idx = i
+                    A_char = alpha_chars[0]
                     break
+            if A_idx is None:
+                continue
 
-                # Paragraph-local median and threshold
-                sizes = [_dc_run_size_pt(r, p) for r in runs]
-                median_sz = _dc_median(sizes)
-                threshold = 1.5 * median_sz
+            # Collect C until a tab/br
+            C_parts = []
+            j = A_idx + 1
+            saw_content = False
+            while j < len(runs) and not _dc_has_tab_or_br(runs[j]):
+                C_parts.append(runs[j].text or "")
+                if (runs[j].text or "").strip():
+                    saw_content = True
+                j += 1
+            if not saw_content:
+                continue
 
-                # Find candidate A (single alpha glyph run, size >= threshold)
-                A_idx = None
-                A_char = None
-                for i, r in enumerate(runs):
-                    t = r.text or ""
-                    alpha_chars = [ch for ch in t if ch.isalpha()]
-                    if len(alpha_chars) == 1 and sizes[i] is not None and sizes[i] >= threshold:
-                        A_idx = i
-                        A_char = alpha_chars[0]
-                        break
-                if A_idx is None:
-                    break  # No further pattern in this paragraph
+            # Must have at least one tab/br (gap D)
+            d = j
+            if d >= len(runs) or not _dc_has_tab_or_br(runs[d]):
+                continue
+            while d < len(runs) and _dc_has_tab_or_br(runs[d]):
+                d += 1
+            if d >= len(runs):
+                continue
 
-                # Collect C until a TAB/BR
-                C_parts = []
-                j = A_idx + 1
-                saw_C = False
-                while j < len(runs) and not _dc_has_tab_or_br(runs[j]):
-                    txt = runs[j].text or ""
-                    C_parts.append(txt)
+            # E: next normal runs after gap
+            E_parts = []
+            k = d
+            saw_E = False
+            while k < len(runs) and not _dc_has_tab_or_br(runs[k]):
+                txt = runs[k].text or ""
+                if txt:
+                    E_parts.append(txt)
                     if txt.strip():
-                        saw_C = True
-                    j += 1
-                if not saw_C:
-                    break  # No meaningful C
+                        saw_E = True
+                k += 1
+            if not saw_E:
+                continue
 
-                # Ensure a TAB/BR gap present
-                d = j
-                if d >= len(runs) or not _dc_has_tab_or_br(runs[d]):
-                    break
-                while d < len(runs) and _dc_has_tab_or_br(runs[d]):
-                    d += 1
-                if d >= len(runs):
-                    break
+            # G: remainder after E (skip any gap markers)
+            while k < len(runs) and _dc_has_tab_or_br(runs[k]):
+                k += 1
+            G_parts = [ (r.text or "") for r in runs[k:] ] if k < len(runs) else []
 
-                # E segment after gap
-                E_parts = []
-                k = d
-                saw_E = False
-                while k < len(runs) and not _dc_has_tab_or_br(runs[k]):
-                    txt = runs[k].text or ""
-                    if txt:
-                        E_parts.append(txt)
-                        if txt.strip():
-                            saw_E = True
-                    k += 1
-                if not saw_E:
-                    break
+            AE = (A_char.upper() + "".join(E_parts)).strip()
+            C_text = " ".join(x.strip() for x in ["".join(C_parts)] if x.strip())
+            G_text = " ".join(x.strip() for x in ["".join(G_parts)] if x.strip())
 
-                # Skip any extra gaps after E
-                while k < len(runs) and _dc_has_tab_or_br(runs[k]):
-                    k += 1
-                G_parts = [ (r.text or "") for r in runs[k:] ] if k < len(runs) else []
+            new_text = AE
+            if C_text:
+                new_text += " " + C_text
+            if G_text:
+                new_text += " " + G_text
 
-                # Build AE C G (A concatenated to E; then space C; then space G if present)
-                AE = (A_char.upper() + "".join(E_parts)).strip()
-                C_text = " ".join(x.strip() for x in ["".join(C_parts)] if x.strip())
-                G_text = " ".join(x.strip() for x in ["".join(G_parts)] if x.strip())
+            if new_text.strip() != (p.text or "").strip():
+                p.text = new_text
+                changes += 1
 
-                new_text = AE
-                if C_text:
-                    new_text += " " + C_text
-                if G_text:
-                    new_text += " " + G_text
-
-                if new_text.strip() and new_text.strip() != (p.text or "").strip():
-                    p.text = new_text
-                    changed_para = True
-                    doc_changes += 1
-
-        if doc_changes == 0:
+        if changes == 0:
             break
     return doc
+
+
+def _fix_one_dropcap_occurrence(doc, start_idx=0):
+    """Scan paragraphs from start_idx and apply the size-based A/E/C/G rewrite to the first match found.
+       Returns (changed: bool, next_index: int)."""
+    paras = list(doc.paragraphs)
+    n = len(paras)
+    for pi in range(start_idx, n):
+        p = paras[pi]
+        runs = list(p.runs)
+        if not runs:
+            continue
+
+        sizes = [_dc_run_size_pt(r, p) for r in runs]
+        median_sz = _dc_median(sizes)
+        threshold = 1.5 * median_sz
+
+        # Candidate A
+        A_idx = None
+        A_char = None
+        for i, r in enumerate(runs):
+            t = r.text or ""
+            alpha_chars = [ch for ch in t if ch.isalpha()]
+            if len(alpha_chars) == 1 and sizes[i] is not None and sizes[i] >= threshold:
+                A_idx = i
+                A_char = alpha_chars[0]
+                break
+        if A_idx is None:
+            continue
+
+        # C segment: until tab/br
+        C_parts = []
+        j = A_idx + 1
+        saw_C = False
+        while j < len(runs) and not _dc_has_tab_or_br(runs[j]):
+            txt = runs[j].text or ""
+            C_parts.append(txt)
+            if txt.strip():
+                saw_C = True
+            j += 1
+        if not saw_C:
+            continue
+
+        # Gap D must exist
+        d = j
+        if d >= len(runs) or not _dc_has_tab_or_br(runs[d]):
+            continue
+        while d < len(runs) and _dc_has_tab_or_br(runs[d]):
+            d += 1
+        if d >= len(runs):
+            continue
+
+        # E segment
+        E_parts = []
+        k = d
+        saw_E = False
+        while k < len(runs) and not _dc_has_tab_or_br(runs[k]):
+            txt = runs[k].text or ""
+            if txt:
+                E_parts.append(txt)
+                if txt.strip():
+                    saw_E = True
+            k += 1
+        if not saw_E:
+            continue
+
+        # Skip any further gaps after E
+        while k < len(runs) and _dc_has_tab_or_br(runs[k]):
+            k += 1
+        G_parts = [(r.text or "") for r in runs[k:]] if k < len(runs) else []
+
+        # Build AE C G
+        AE = (A_char.upper() + "".join(E_parts)).strip()
+        C_text = " ".join(x.strip() for x in ["".join(C_parts)] if x.strip())
+        G_text = " ".join(x.strip() for x in ["".join(G_parts)] if x.strip())
+        new_text = AE + ((" " + C_text) if C_text else "") + ((" " + G_text) if G_text else "")
+
+        if new_text.strip() and new_text.strip() != (p.text or "").strip():
+            p.text = new_text
+            return True, pi + 1  # continue from next paragraph after a change
+    return False, n
+
 
 def _drop_nonchars(s: str) -> str:
     out = []
@@ -278,7 +350,7 @@ def convert_docx_bytes_to_us(docx_bytes: bytes) -> bytes:
     if Document is None:
         raise RuntimeError("python-docx required.")
     doc = Document(io.BytesIO(docx_bytes))
-    fix_dropcap_reorder_by_size(doc)
+    fix_all_dropcaps(doc)
     convert_docx_runs_to_us(doc)
     out = io.BytesIO(); doc.save(out)
     return out.getvalue()
@@ -296,7 +368,7 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
         cv.convert(out_path, start=0, end=None)
         cv.close()
         doc = Document(out_path)
-        fix_dropcap_reorder_by_size(doc)
+        fix_all_dropcaps(doc)
 
         # 1) Deep removal across all parts (fix persistent squares)
         _remove_global_shapes_all_parts(doc)
@@ -451,3 +523,20 @@ if uploaded is not None:
                     st.error(f"Conversion failed: {e}")
         else:
             st.error("Unsupported file type. Please upload a .docx or .pdf.")
+
+def fix_all_dropcaps(doc, max_passes=20):
+    """Deterministically fix up to max_passes drop-cap reorderings across the entire document."""
+    idx = 0
+    passes = 0
+    while passes < max_passes:
+        changed, idx = _fix_one_dropcap_occurrence(doc, start_idx=idx)
+        if not changed:
+            # Restart from the top once to catch any pattern that may appear earlier
+            if idx != 0:
+                idx = 0
+                passes += 1
+                continue
+            break
+        passes += 1
+    return doc
+
