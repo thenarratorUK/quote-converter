@@ -132,7 +132,9 @@ def _collect_runs_text(runs, start, stop_pred):
     return "".join(parts), j
 
 def _fix_one_unified_in_paragraph(p):
-    """Apply unified drop-cap fix once in paragraph p; return True if changed."""
+    """Apply unified drop-cap fix once in paragraph p; return True if changed.
+       This version can split E **inside** a run (mid-run), not only at run boundaries.
+    """
     runs = list(p.runs)
     if not runs:
         return False
@@ -154,8 +156,12 @@ def _fix_one_unified_in_paragraph(p):
     if A_idx is None:
         return False
 
-    # C segment: subsequent normal runs up to gap or potential lexical boundary
-    # First try strict gap: C until first tab/br
+    # Gather the tail (text after A) as both per-run fragments and a single concatenated string
+    tail_runs = runs[A_idx+1:]
+    tail_texts = [(_dc_run_text(r) or "") for r in tail_runs]
+    tail_concat = "".join(tail_texts)
+
+    # First try strict gap detection on run sequence
     j = A_idx + 1
     C_parts = []
     while j < len(runs) and not _dc_has_tab_or_br(runs[j]):
@@ -164,16 +170,14 @@ def _fix_one_unified_in_paragraph(p):
     has_gap = (j < len(runs) and _dc_has_tab_or_br(runs[j]))
 
     if has_gap:
-        # Skip gap markers
+        # As before: E is runs after the gap; G is remainder
         k = j
         while k < len(runs) and _dc_has_tab_or_br(runs[k]):
             k += 1
-        # E = next normal runs until next tab/br or end
         E_parts = []
         while k < len(runs) and not _dc_has_tab_or_br(runs[k]):
             E_parts.append(_dc_run_text(runs[k]) or "")
             k += 1
-        # Skip any additional gaps
         while k < len(runs) and _dc_has_tab_or_br(runs[k]):
             k += 1
         G_parts = [(_dc_run_text(runs[t]) or "") for t in range(k, len(runs))] if k < len(runs) else []
@@ -183,38 +187,30 @@ def _fix_one_unified_in_paragraph(p):
         if not C_text or not E_text:
             return False
     else:
-        # No explicit gap; need lexical boundary scan inside the normal-sized stream
-        # Scan the following runs to find earliest plausible sentence start as E
-        # We will evaluate cumulative text and check boundaries between runs.
-        # Build a list of normal-sized run texts after A
-        tail_texts = [(_dc_run_text(runs[t]) or "") for t in range(A_idx+1, len(runs))]
-        # Find split point between C and E
-        c_end = None
-        accum = ""
-        for offset, frag in enumerate(tail_texts):
-            prev = accum
-            accum += frag
-            # Boundary candidate is at the *start* of 'frag'
-            if _looks_like_sentence_start(frag):
-                # Ensure some C exists
-                if prev.strip():
-                    c_end = offset  # C uses tail_texts[:offset]
-                    break
-        if c_end is None:
-            return False
-        C_text = "".join(tail_texts[:c_end]).strip()
-        E_text = "".join(tail_texts[c_end:]).strip()
-        G_text = ""  # we took the rest as E; G empty in no-gap case
-        if not C_text or not E_text:
+        # No explicit gap; find E *inside* the concatenated tail by lexical cues
+        def find_lexical_split(s):
+            # ALL CAPS token(s) span (>=2 letters), prefer earliest occurrence not at position 0
+            m = re.search(r'\b[A-Z]{2,}(?:\s+[A-Z]{2,})+\b', s)
+            if m and m.start() > 0:
+                return m.start()
+            # Capitalized word boundary anywhere after position 0
+            m2 = re.search(r'(?<!\w)([A-Z][a-z][A-Za-z\'-]*)', s)
+            if m2 and m2.start() > 0:
+                return m2.start()
+            return None
+
+        split_idx = find_lexical_split(tail_concat)
+        if split_idx is None:
             return False
 
-    # Rebuild paragraph: AE + " " + C + optional " " + G
+        C_text = tail_concat[:split_idx].strip()
+        E_text = tail_concat[split_idx:].strip()
+        if not C_text or not E_text:
+            return False
+        G_text = ""
+
     AE = (A_char.upper() + E_text).strip()
-    new_text = AE
-    if C_text:
-        new_text += " " + C_text
-    if G_text:
-        new_text += " " + G_text
+    new_text = AE + ((" " + C_text) if C_text else "") + ((" " + G_text) if G_text else "")
 
     if new_text.strip() and new_text.strip() != (p.text or "").strip():
         p.text = new_text
