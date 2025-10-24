@@ -1,4 +1,3 @@
-# quote_converter_app_pdf2docx_final_globclean_v3.py
 import io, os, re, tempfile, streamlit as st
 
 try:
@@ -269,12 +268,13 @@ st.title("UK to US Quote Converter with Optional PDF to DOCX Conversion")
 st.write("Please upload a docx using single-quotes dialogue for conversion to double-quotes dialogue, or upload a PDF of either type for conversion to double-quotes dialogue in a docx.")
 
 uploaded = st.file_uploader(
-    "",
+    "Upload DOCX (single-quotes) or PDF",
     type=["docx", "pdf"],
     accept_multiple_files=False,
     key="file",
     label_visibility="collapsed"
 )
+
 
 
 if uploaded is not None:
