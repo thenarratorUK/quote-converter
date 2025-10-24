@@ -51,7 +51,196 @@ def _dc_median(vals):
     except Exception:
         return sum(vals)/len(vals)
 
-def fix_all_dropcaps(doc):
+
+
+# === Unified drop-cap fixer: D (tab/br) optional, with lexical fallback for E; multi-pass across doc ===
+def _dc_pt(val, default=None):
+    try:
+        return float(val.pt) if hasattr(val, "pt") else (float(val) if val is not None else default)
+    except Exception:
+        return default
+
+def _dc_run_size_pt(run, para, default=11.0):
+    sz = _dc_pt(getattr(run.font, "size", None))
+    if sz is not None:
+        return sz
+    try:
+        psz = _dc_pt(para.style.font.size, None)
+        if psz is not None:
+            return psz
+    except Exception:
+        pass
+    return default
+
+def _dc_has_tab_or_br(run):
+    try:
+        el = run._element
+        # Look for <w:tab/> or <w:br/>
+        return bool(el.xpath(".//w:tab|.//w:br"))
+    except Exception:
+        return False
+
+def _dc_median(vals):
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return 11.0
+    try:
+        import statistics as _stats
+        return float(_stats.median(vals))
+    except Exception:
+        return sum(vals) / len(vals)
+
+def _dc_run_text(run):
+    # Concatenate all text nodes for this run
+    try:
+        return "".join(t.text or "" for t in run._element.xpath(".//w:t", namespaces=run._element.nsmap))
+    except Exception:
+        # Fallback via python-docx API
+        return "".join([getattr(t, "text", "") or "" for t in getattr(run, "text", "")])
+
+def _looks_like_sentence_start(s):
+    """Conservative heuristic for E when no gap: 
+    - starts with ALL CAPS word(s) (len>=2) followed by space, or
+    - starts with CapitalizedWord (A-Z then lowercase) and then lowercase/space/punct follows,
+    - disallow pure digits.
+    """
+    if not s:
+        return False
+    s_stripped = s.lstrip()
+    if not s_stripped:
+        return False
+    # Reject if first token starts with digit
+    if s_stripped[0].isdigit():
+        return False
+    # ALL-CAPS token(s) at start (at least 2 letters)
+    m_all = re.match(r'^[A-Z]{2,}(?:\s+[A-Z]{2,})*[\s,.;:!?-]', s_stripped)
+    if m_all:
+        return True
+    # Capitalized word at start
+    m_cap = re.match(r'^[A-Z][a-z][A-Za-z\'-]*', s_stripped)
+    if m_cap:
+        return True
+    return False
+
+def _collect_runs_text(runs, start, stop_pred):
+    """Collect text from runs[start:] until stop_pred(run_index) returns True (exclusive)."""
+    parts = []
+    j = start
+    while j < len(runs) and not stop_pred(j):
+        parts.append(_dc_run_text(runs[j]) or "")
+        j += 1
+    return "".join(parts), j
+
+def _fix_one_unified_in_paragraph(p):
+    """Apply unified drop-cap fix once in paragraph p; return True if changed."""
+    runs = list(p.runs)
+    if not runs:
+        return False
+
+    sizes = [_dc_run_size_pt(r, p) for r in runs]
+    median_sz = _dc_median(sizes)
+    threshold = 1.5 * median_sz
+
+    # Find candidate A: single alphabetic glyph (allow space) with size >= threshold
+    A_idx = None
+    A_char = None
+    for i, r in enumerate(runs):
+        txt = _dc_run_text(r)
+        alpha = [ch for ch in txt if ch.isalpha()]
+        if len(alpha) == 1 and sizes[i] is not None and sizes[i] >= threshold:
+            A_idx = i
+            A_char = alpha[0]
+            break
+    if A_idx is None:
+        return False
+
+    # C segment: subsequent normal runs up to gap or potential lexical boundary
+    # First try strict gap: C until first tab/br
+    j = A_idx + 1
+    C_parts = []
+    while j < len(runs) and not _dc_has_tab_or_br(runs[j]):
+        C_parts.append(_dc_run_text(runs[j]) or "")
+        j += 1
+    has_gap = (j < len(runs) and _dc_has_tab_or_br(runs[j]))
+
+    if has_gap:
+        # Skip gap markers
+        k = j
+        while k < len(runs) and _dc_has_tab_or_br(runs[k]):
+            k += 1
+        # E = next normal runs until next tab/br or end
+        E_parts = []
+        while k < len(runs) and not _dc_has_tab_or_br(runs[k]):
+            E_parts.append(_dc_run_text(runs[k]) or "")
+            k += 1
+        # Skip any additional gaps
+        while k < len(runs) and _dc_has_tab_or_br(runs[k]):
+            k += 1
+        G_parts = [(_dc_run_text(runs[t]) or "") for t in range(k, len(runs))] if k < len(runs) else []
+        C_text = "".join(C_parts).strip()
+        E_text = "".join(E_parts).strip()
+        G_text = "".join(G_parts).strip()
+        if not C_text or not E_text:
+            return False
+    else:
+        # No explicit gap; need lexical boundary scan inside the normal-sized stream
+        # Scan the following runs to find earliest plausible sentence start as E
+        # We will evaluate cumulative text and check boundaries between runs.
+        # Build a list of normal-sized run texts after A
+        tail_texts = [(_dc_run_text(runs[t]) or "") for t in range(A_idx+1, len(runs))]
+        # Find split point between C and E
+        c_end = None
+        accum = ""
+        for offset, frag in enumerate(tail_texts):
+            prev = accum
+            accum += frag
+            # Boundary candidate is at the *start* of 'frag'
+            if _looks_like_sentence_start(frag):
+                # Ensure some C exists
+                if prev.strip():
+                    c_end = offset  # C uses tail_texts[:offset]
+                    break
+        if c_end is None:
+            return False
+        C_text = "".join(tail_texts[:c_end]).strip()
+        E_text = "".join(tail_texts[c_end:]).strip()
+        G_text = ""  # we took the rest as E; G empty in no-gap case
+        if not C_text or not E_text:
+            return False
+
+    # Rebuild paragraph: AE + " " + C + optional " " + G
+    AE = (A_char.upper() + E_text).strip()
+    new_text = AE
+    if C_text:
+        new_text += " " + C_text
+    if G_text:
+        new_text += " " + G_text
+
+    if new_text.strip() and new_text.strip() != (p.text or "").strip():
+        p.text = new_text
+        return True
+    return False
+
+def fix_dropcaps_unified(doc, max_passes=50):
+    """Run as many passes as required until a full pass makes no changes (or max_passes reached)."""
+    passes = 0
+    while passes < max_passes:
+        changes = 0
+        for p in doc.paragraphs:
+            # Repeat within the paragraph until stable (covers multiple drop caps in one paragraph)
+            inner_loops = 0
+            while inner_loops < 8:
+                inner_loops += 1
+                if not _fix_one_unified_in_paragraph(p):
+                    break
+                changes += 1
+        if changes == 0:
+            break
+        passes += 1
+    return doc
+# === end unified drop-cap fixer ===
+
+def fix_dropcaps_unified(doc):
     """
     Multi-pass drop-cap reorder:
       - Repeats scanning and fixing until no further changes are made in the document (max 8 passes).
@@ -350,7 +539,8 @@ def convert_docx_bytes_to_us(docx_bytes: bytes) -> bytes:
     if Document is None:
         raise RuntimeError("python-docx required.")
     doc = Document(io.BytesIO(docx_bytes))
-    fix_all_dropcaps(doc)
+    fix_dropcaps_unified(doc)
+    fix_dropcaps_unified(doc)
     convert_docx_runs_to_us(doc)
     out = io.BytesIO(); doc.save(out)
     return out.getvalue()
@@ -368,7 +558,8 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
         cv.convert(out_path, start=0, end=None)
         cv.close()
         doc = Document(out_path)
-        fix_all_dropcaps(doc)
+        fix_dropcaps_unified(doc)
+        fix_dropcaps_unified(doc)
 
         # 1) Deep removal across all parts (fix persistent squares)
         _remove_global_shapes_all_parts(doc)
