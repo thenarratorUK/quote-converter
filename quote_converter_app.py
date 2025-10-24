@@ -182,9 +182,7 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
 
 st.set_page_config(page_title="Quote Style Converter (Global Clean v3)", page_icon="📝", layout="centered")
 
-CSS = """
-<style>
-:root {
+CSS = """:root {
   --primary-color: #008080;      /* Teal */
   --primary-hover: #007070;
   --background-color: #fdfdfd;
@@ -256,18 +254,19 @@ input:focus, select:focus, textarea:focus {
   border-color: var(--primary-color);
   box-shadow: 0 0 5px rgba(0, 128, 128, 0.3);
 }
-</style>
 
 /* Enforce font in uploader */
-.stFileUploader, .stFileUploader label, .stFileUploader div, .stFileUploader button, .stFileUploader * {
+.stFileUploader, .stFileUploader label, .stFileUploader div, .stFileUploader button, .stFileUploader *,
+[data-testid="stFileUploader"], [data-testid="stFileUploader"] *, [data-testid="stFileUploadDropzone"], [data-testid="stFileUploadDropzone"] *,
+input[type="file"] {
   font-family: var(--font-family) !important;
 }
 
 """
 st.markdown("<style>\n"+CSS+"\n</style>", unsafe_allow_html=True)
 
-st.title("UK to UK Quote Converter with Optional PDF to DOCX Conversion")
-st.write("Please upload a docx using single quote dialogue for conversion to double quote dialogue, or upload a PDF of either type for conversion to double quote dialogue in a docx.")
+st.title("UK to US Quote Converter with Optional PDF to DOCX Conversion")
+st.write("Please upload a docx using single-quotes dialogue for conversion to double-quotes dialogue, or upload a PDF of either type for conversion to double-quotes dialogue in a docx.")
 
 uploaded = st.file_uploader(
     "",
@@ -277,33 +276,37 @@ uploaded = st.file_uploader(
     label_visibility="collapsed"
 )
 
+
 if uploaded is not None:
-    name_lower = uploaded.name.lower()
-    if name_lower.endswith(".docx"):
-        if Document is None:
-            st.error("python-docx not available; cannot process DOCX.")
+    # Show a simple file summary and a Convert button
+    st.write(f"Selected file: **{uploaded.name}**")
+    if st.button("Convert"):
+        name_lower = uploaded.name.lower()
+        if name_lower.endswith(".docx"):
+            if Document is None:
+                st.error("python-docx not available; cannot process DOCX.")
+            else:
+                try:
+                    raw = uploaded.read()
+                    out_bytes = docx_bytes_to_us_quotes(raw) if 'docx_bytes_to_us_quotes' in globals() else convert_docx_bytes_to_us(raw)
+                    st.success("Converted. Download below.")
+                    st.download_button("Download File", out_bytes,
+                        file_name=uploaded.name,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                except Exception as e:
+                    st.error(f"Conversion failed: {e}")
+        elif name_lower.endswith(".pdf"):
+            if PDF2DOCXConverter is None:
+                st.error("pdf2docx not available; cannot convert PDF to DOCX.")
+            else:
+                try:
+                    out_bytes = pdf_bytes_to_docx_using_pdf2docx(uploaded.read())
+                    st.success("Converted. Download below.")
+                    base = uploaded.name.rsplit(".",1)[0]
+                    st.download_button("Download File", out_bytes,
+                        file_name=base + ".docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                except Exception as e:
+                    st.error(f"Conversion failed: {e}")
         else:
-            try:
-                raw = uploaded.read()
-                out_bytes = docx_bytes_to_us_quotes(raw) if 'docx_bytes_to_us_quotes' in globals() else convert_docx_bytes_to_us(raw)
-                st.success("Converted. Download below.")
-                st.download_button("Download File", out_bytes,
-                    file_name=uploaded.name,
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-            except Exception as e:
-                st.error(f"Conversion failed: {e}")
-    elif name_lower.endswith(".pdf"):
-        if PDF2DOCXConverter is None:
-            st.error("pdf2docx not available; cannot convert PDF to DOCX.")
-        else:
-            try:
-                out_bytes = pdf_bytes_to_docx_using_pdf2docx(uploaded.read())
-                st.success("Converted. Download below.")
-                base = uploaded.name.rsplit(".",1)[0]
-                st.download_button("Download File", out_bytes,
-                    file_name=base + ".docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-            except Exception as e:
-                st.error(f"Conversion failed: {e}")
-    else:
-        st.error("Unsupported file type. Please upload a .docx or .pdf.")
+            st.error("Unsupported file type. Please upload a .docx or .pdf.")
