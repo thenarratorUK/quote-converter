@@ -269,7 +269,14 @@ st.markdown("<style>\n"+CSS+"\n</style>", unsafe_allow_html=True)
 st.title("UK to UK Quote Converter with Optional PDF to DOCX Conversion")
 st.write("Please upload a docx using single quote dialogue for conversion to double quote dialogue, or upload a PDF of either type for conversion to double quote dialogue in a docx.")
 
-uploaded = st.file_uploader("", type=["docx","pdf"], accept_multiple_files=False, key="file", label_visibility="collapsed") or a .pdf", type=["docx","pdf"])
+uploaded = st.file_uploader(
+    "",
+    type=["docx", "pdf"],
+    accept_multiple_files=False,
+    key="file",
+    label_visibility="collapsed"
+)
+
 if uploaded is not None:
     name_lower = uploaded.name.lower()
     if name_lower.endswith(".docx"):
