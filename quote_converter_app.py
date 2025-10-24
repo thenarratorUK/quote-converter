@@ -49,103 +49,93 @@ def _dc_median(vals):
 
 def fix_dropcap_reorder_by_size(doc):
     """
-    Reorder mis-placed lines caused by drop caps inside a single paragraph, using font-size signals.
-
-    Pattern (within one paragraph's runs):
-      A = single-letter run (optionally with trailing space) whose size >= 1.5 × median run size
-      C = subsequent normal-sized run(s) up to (but not including) a <w:tab/> or <w:br/> (the 'gap')
-      D = the tab/br run(s)
-      E = subsequent normal-sized run(s) immediately after the tab/br
-      G = remaining runs (continuation)
-    Output paragraph text becomes:  A + E + " " + C + " " + G  (with A concatenated directly to E)
-
-    Notes:
-      • Operates conservatively: triggers only if all segments A, C, D, E exist in order.
-      • Works when pdf2docx preserves a very large font for the drop cap and normal sizes for others.
-      • Keeps changes local to the paragraph; does not alter UI.
+    Multi-pass drop-cap reorder:
+      - Repeats scanning and fixing until no further changes are made in the document (max 8 passes).
+      - Each pass scans every paragraph and applies the size-based A/E/C/G reconstruction where the pattern is found.
     """
-    for p in doc.paragraphs:
-        runs = list(p.runs)
-        if not runs:
-            continue
-        sizes = [ _dc_run_size_pt(r, p) for r in runs ]
-        median_sz = _dc_median(sizes)
-        threshold = 1.5 * median_sz
+    MAX_PASSES = 8
+    for _ in range(MAX_PASSES):
+        changes = 0
+        for p in doc.paragraphs:
+            runs = list(p.runs)
+            if not runs:
+                continue
 
-        # Find candidate drop cap run A (single alpha glyph, maybe with trailing space), size >= threshold
-        A_idx = None
-        A_char = None
-        for i, r in enumerate(runs):
-            t = r.text or ""
-            t_stripped = t.strip()
-            # Accept "M" or "M " or " M" (preserve-space overhangs), but must contain exactly one alphabetic glyph
-            alpha_chars = [ch for ch in t if ch.isalpha()]
-            if len(alpha_chars) == 1 and sizes[i] is not None and sizes[i] >= threshold:
-                A_idx = i
-                A_char = alpha_chars[0]
-                break
-        if A_idx is None:
-            continue
+            # Compute paragraph-level median size to adapt to local formatting
+            sizes = [ _dc_run_size_pt(r, p) for r in runs ]
+            median_sz = _dc_median(sizes)
+            threshold = 1.5 * median_sz
 
-        # Collect C = runs after A until we hit a tab/br (not inclusive), normal-sized preferred
-        C_parts = []
-        j = A_idx + 1
-        saw_content = False
-        while j < len(runs) and not _dc_has_tab_or_br(runs[j]):
-            # Treat anything here as part of C (even if a size outlier sneaks in); this matches observed behaviour
-            C_parts.append(runs[j].text or "")
-            if (runs[j].text or "").strip():
-                saw_content = True
-            j += 1
-        if not saw_content:
-            continue  # No meaningful C segment
+            # Find candidate A
+            A_idx = None
+            A_char = None
+            for i, r in enumerate(runs):
+                t = r.text or ""
+                alpha_chars = [ch for ch in t if ch.isalpha()]
+                if len(alpha_chars) == 1 and sizes[i] is not None and sizes[i] >= threshold:
+                    A_idx = i
+                    A_char = alpha_chars[0]
+                    break
+            if A_idx is None:
+                continue
 
-        # D = one or more tab/br runs
-        d = j
-        if d >= len(runs) or not _dc_has_tab_or_br(runs[d]):
-            continue
-        while d < len(runs) and _dc_has_tab_or_br(runs[d]):
-            d += 1
-        if d >= len(runs):
-            continue
+            # Collect C until a tab/br
+            C_parts = []
+            j = A_idx + 1
+            saw_content = False
+            while j < len(runs) and not _dc_has_tab_or_br(runs[j]):
+                C_parts.append(runs[j].text or "")
+                if (runs[j].text or "").strip():
+                    saw_content = True
+                j += 1
+            if not saw_content:
+                continue
 
-        # E = next normal runs after D, until we potentially hit another tab/br (rare) or end of paragraph
-        E_parts = []
-        k = d
-        saw_E = False
-        while k < len(runs) and not _dc_has_tab_or_br(runs[k]):
-            txt = runs[k].text or ""
-            if txt:
-                E_parts.append(txt)
-                if txt.strip():
-                    saw_E = True
-            k += 1
-        if not saw_E:
-            continue
+            # Must have at least one tab/br (gap D)
+            d = j
+            if d >= len(runs) or not _dc_has_tab_or_br(runs[d]):
+                continue
+            while d < len(runs) and _dc_has_tab_or_br(runs[d]):
+                d += 1
+            if d >= len(runs):
+                continue
 
-        # G = remainder after E (skip any further tab/br blocks between E and G if present)
-        while k < len(runs) and _dc_has_tab_or_br(runs[k]):
-            k += 1
-        G_parts = [ (r.text or "") for r in runs[k:] ] if k < len(runs) else []
+            # E: next normal runs after gap
+            E_parts = []
+            k = d
+            saw_E = False
+            while k < len(runs) and not _dc_has_tab_or_br(runs[k]):
+                txt = runs[k].text or ""
+                if txt:
+                    E_parts.append(txt)
+                    if txt.strip():
+                        saw_E = True
+                k += 1
+            if not saw_E:
+                continue
 
-        # Build new text: A + E + " " + C + " " + G
-        AE = (A_char.upper() + "".join(E_parts)).strip()
-        new_text = AE
-        C_text = " ".join(x.strip() for x in ["".join(C_parts)] if x.strip())
-        G_text = " ".join(x.strip() for x in ["".join(G_parts)] if x.strip())
-        if C_text:
-            new_text += " " + C_text
-        if G_text:
-            new_text += " " + G_text
+            # G: remainder after E (skip any gap markers)
+            while k < len(runs) and _dc_has_tab_or_br(runs[k]):
+                k += 1
+            G_parts = [ (r.text or "") for r in runs[k:] ] if k < len(runs) else []
 
-        # Assign reconstructed text to the paragraph (resets runs/formatting in this paragraph)
-        p.text = new_text
+            AE = (A_char.upper() + "".join(E_parts)).strip()
+            C_text = " ".join(x.strip() for x in ["".join(C_parts)] if x.strip())
+            G_text = " ".join(x.strip() for x in ["".join(G_parts)] if x.strip())
+
+            new_text = AE
+            if C_text:
+                new_text += " " + C_text
+            if G_text:
+                new_text += " " + G_text
+
+            if new_text.strip() != (p.text or "").strip():
+                p.text = new_text
+                changes += 1
+
+        if changes == 0:
+            break
     return doc
-# === end drop-cap heuristic ===
-
-
-
-_ASCII_CTRL = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')
 
 def _drop_nonchars(s: str) -> str:
     out = []
