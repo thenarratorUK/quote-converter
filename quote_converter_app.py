@@ -10,120 +10,136 @@ try:
 except Exception:
     PDF2DOCXConverter = None
 
-# === Drop-cap heuristic (strict, size-based) ===
+# === Drop-cap reorder heuristic (size-based, within a paragraph) ===
+def _dc_pt(val, default=None):
+    try:
+        return float(val.pt) if hasattr(val, "pt") else (float(val) if val is not None else default)
+    except Exception:
+        return default
+
 def _dc_run_size_pt(run, para, default=11.0):
-    def _pt(x):
-        try:
-            return float(x.pt) if hasattr(x, "pt") else (float(x) if x is not None else None)
-        except Exception:
-            return None
-    sz = _pt(getattr(run.font, "size", None))
+    sz = _dc_pt(getattr(run.font, "size", None))
     if sz is not None:
         return sz
     try:
-        psz = _pt(para.style.font.size)
+        psz = _dc_pt(para.style.font.size, None)
         if psz is not None:
             return psz
     except Exception:
         pass
     return default
 
-def _dc_alpha_positions_with_sizes(paragraph):
-    for ri, run in enumerate(paragraph.runs):
-        t = run.text or ""
-        if not t:
+def _dc_has_tab_or_br(run):
+    try:
+        el = run._element
+        # Look for <w:tab/> or <w:br/>
+        return el.xpath(".//w:tab|.//w:br") != []
+    except Exception:
+        return False
+
+def _dc_median(vals):
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return 11.0
+    try:
+        import statistics as _stats
+        return float(_stats.median(vals))
+    except Exception:
+        return sum(vals)/len(vals)
+
+def fix_dropcap_reorder_by_size(doc):
+    """
+    Reorder mis-placed lines caused by drop caps inside a single paragraph, using font-size signals.
+
+    Pattern (within one paragraph's runs):
+      A = single-letter run (optionally with trailing space) whose size >= 1.5 × median run size
+      C = subsequent normal-sized run(s) up to (but not including) a <w:tab/> or <w:br/> (the 'gap')
+      D = the tab/br run(s)
+      E = subsequent normal-sized run(s) immediately after the tab/br
+      G = remaining runs (continuation)
+    Output paragraph text becomes:  A + E + " " + C + " " + G  (with A concatenated directly to E)
+
+    Notes:
+      • Operates conservatively: triggers only if all segments A, C, D, E exist in order.
+      • Works when pdf2docx preserves a very large font for the drop cap and normal sizes for others.
+      • Keeps changes local to the paragraph; does not alter UI.
+    """
+    for p in doc.paragraphs:
+        runs = list(p.runs)
+        if not runs:
             continue
-        size = _dc_run_size_pt(run, paragraph)
-        for ci, ch in enumerate(t):
-            if ch.isalpha():
-                yield ri, ci, ch, size
+        sizes = [ _dc_run_size_pt(r, p) for r in runs ]
+        median_sz = _dc_median(sizes)
+        threshold = 1.5 * median_sz
 
-def _dc_first_alpha(paragraph):
-    for item in _dc_alpha_positions_with_sizes(paragraph):
-        return item
-    return None
-
-def _dc_next_alpha_in_flow(paragraphs, start_para_idx, start_pos):
-    # Search within the same paragraph after the given (ri, ci), then across following paragraphs
-    p = paragraphs[start_para_idx]
-    ri0, ci0 = start_pos
-    for ri, ci, ch, sz in _dc_alpha_positions_with_sizes(p):
-        if (ri > ri0) or (ri == ri0 and ci > ci0):
-            return ch, sz, start_para_idx
-    for j in range(start_para_idx + 1, len(paragraphs)):
-        for ri, ci, ch, sz in _dc_alpha_positions_with_sizes(paragraphs[j]):
-            return ch, sz, j
-    return None, None, None
-
-def fix_dropcap_reordering_strict(doc):
-    """
-    Detect A (first alpha glyph) as a true drop cap only if its size >= 1.5× the next alpha glyph size.
-    If pattern ABCDEFG is present across paragraphs, rewrite to AE C G (A concatenated to E; E, C, G separated by spaces).
-    The heuristic collapses the affected paragraphs into a single paragraph and avoids UI changes.
-    """
-    paras = list(doc.paragraphs)
-    i = 0
-    while i < len(paras):
-        p = paras[i]
-        t = p.text or ""
-
-        first = _dc_first_alpha(p)
-        if first is None:
-            i += 1; continue
-        ri0, ci0, Achar, Asz = first
-
-        # find next alpha glyph size in document flow
-        Bchar, Bsz, _ = _dc_next_alpha_in_flow(paras, i, (ri0, ci0))
-        if Bsz is None or Asz < 1.5 * Bsz:
-            i += 1; continue
-
-        # We expect paragraph i to effectively start with A then spaces then rest (C)
-        # Extract C conservatively with a simple pattern on the paragraph's visible text
-        mt = re.match(r'^[\s]*([A-Za-z])( +)(.+)$', t)
-        if not mt:
-            i += 1; continue
-        C = mt.group(3).strip()
-
-        # Detect gap D: one or more empty paragraphs after i
-        j = i + 1
-        had_gap = False
-        while j < len(paras) and (paras[j].text or "").strip() == "":
-            had_gap = True
-            j += 1
-        if not had_gap or j >= len(paras):
-            i += 1; continue
-
-        E = (paras[j].text or "").strip()
-
-        # Next non-empty after E is G
-        k = j + 1
-        while k < len(paras) and (paras[k].text or "").strip() == "":
-            k += 1
-        if k >= len(paras):
-            i += 1; continue
-        G = (paras[k].text or "").strip()
-
-        # Build AE C G (no space between A and E)
-        new_text = (Achar.upper() + E).strip()
-        if C:
-            new_text += " " + C
-        if G:
-            new_text += " " + G
-
-        # Replace paragraph i text, then remove paragraphs i+1..k at XML level
-        p.text = new_text
-        for _ in range(k - i):
-            try:
-                nxt = p._element.getnext()
-                if nxt is not None:
-                    p._element.getparent().remove(nxt)
-            except Exception:
+        # Find candidate drop cap run A (single alpha glyph, maybe with trailing space), size >= threshold
+        A_idx = None
+        A_char = None
+        for i, r in enumerate(runs):
+            t = r.text or ""
+            t_stripped = t.strip()
+            # Accept "M" or "M " or " M" (preserve-space overhangs), but must contain exactly one alphabetic glyph
+            alpha_chars = [ch for ch in t if ch.isalpha()]
+            if len(alpha_chars) == 1 and sizes[i] is not None and sizes[i] >= threshold:
+                A_idx = i
+                A_char = alpha_chars[0]
                 break
+        if A_idx is None:
+            continue
 
-        # refresh snapshot after structural change
-        paras = list(doc.paragraphs)
-        i += 1
+        # Collect C = runs after A until we hit a tab/br (not inclusive), normal-sized preferred
+        C_parts = []
+        j = A_idx + 1
+        saw_content = False
+        while j < len(runs) and not _dc_has_tab_or_br(runs[j]):
+            # Treat anything here as part of C (even if a size outlier sneaks in); this matches observed behaviour
+            C_parts.append(runs[j].text or "")
+            if (runs[j].text or "").strip():
+                saw_content = True
+            j += 1
+        if not saw_content:
+            continue  # No meaningful C segment
 
+        # D = one or more tab/br runs
+        d = j
+        if d >= len(runs) or not _dc_has_tab_or_br(runs[d]):
+            continue
+        while d < len(runs) and _dc_has_tab_or_br(runs[d]):
+            d += 1
+        if d >= len(runs):
+            continue
+
+        # E = next normal runs after D, until we potentially hit another tab/br (rare) or end of paragraph
+        E_parts = []
+        k = d
+        saw_E = False
+        while k < len(runs) and not _dc_has_tab_or_br(runs[k]):
+            txt = runs[k].text or ""
+            if txt:
+                E_parts.append(txt)
+                if txt.strip():
+                    saw_E = True
+            k += 1
+        if not saw_E:
+            continue
+
+        # G = remainder after E (skip any further tab/br blocks between E and G if present)
+        while k < len(runs) and _dc_has_tab_or_br(runs[k]):
+            k += 1
+        G_parts = [ (r.text or "") for r in runs[k:] ] if k < len(runs) else []
+
+        # Build new text: A + E + " " + C + " " + G
+        AE = (A_char.upper() + "".join(E_parts)).strip()
+        new_text = AE
+        C_text = " ".join(x.strip() for x in ["".join(C_parts)] if x.strip())
+        G_text = " ".join(x.strip() for x in ["".join(G_parts)] if x.strip())
+        if C_text:
+            new_text += " " + C_text
+        if G_text:
+            new_text += " " + G_text
+
+        # Assign reconstructed text to the paragraph (resets runs/formatting in this paragraph)
+        p.text = new_text
     return doc
 # === end drop-cap heuristic ===
 
@@ -258,7 +274,7 @@ def convert_docx_bytes_to_us(docx_bytes: bytes) -> bytes:
     if Document is None:
         raise RuntimeError("python-docx required.")
     doc = Document(io.BytesIO(docx_bytes))
-    fix_dropcap_reordering_strict(doc)
+    fix_dropcap_reorder_by_size(doc)
     convert_docx_runs_to_us(doc)
     out = io.BytesIO(); doc.save(out)
     return out.getvalue()
@@ -276,7 +292,7 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
         cv.convert(out_path, start=0, end=None)
         cv.close()
         doc = Document(out_path)
-        fix_dropcap_reordering_strict(doc)
+        fix_dropcap_reorder_by_size(doc)
 
         # 1) Deep removal across all parts (fix persistent squares)
         _remove_global_shapes_all_parts(doc)
