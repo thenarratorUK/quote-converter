@@ -1,9 +1,8 @@
-# quote_converter_app_pdf2docx_dropcap_v6.py
+# quote_converter_app_pdf2docx_dropcap_v7.py
 import io, os, re, tempfile, streamlit as st
 
 try:
     from docx import Document
-    from docx.shared import Pt
 except Exception:
     Document = None
 
@@ -42,53 +41,23 @@ def sanitize_for_docx(text: str) -> str:
     text = _drop_nonchars(text)
     return _xml10_filter(text)
 
-def _detect_primary_style(text: str) -> str:
-    if not text:
-        return "UNKNOWN"
-    singles_open = len(re.findall(r'(^|[\\s(\\[{<])‘', text))
-    doubles_open = len(re.findall(r'(^|[\\s(\\[{<])“', text))
-    singles_total = text.count("‘") + text.count("’")
-    doubles_total = text.count("“") + text.count("”")
-    if singles_open >= doubles_open * 1.5 and singles_open >= 4:
-        return "UK"
-    if doubles_open >= singles_open * 1.2 and doubles_open >= 4:
-        return "US"
-    if doubles_total > singles_total * 1.2 and doubles_open >= 2:
-        return "US"
-    if singles_total > doubles_total * 1.5 and singles_open >= 2:
-        return "UK"
-    return "UNKNOWN"
-
 def normalize_quotes_to_us(text: str) -> str:
     if not text:
         return text
     APOS = "<<APOS>>"
     text = re.sub(r"(?<=\\w)[’'](?=\\w)", APOS, text)
-    style = _detect_primary_style(text)
-    if style == "UK":
-        OPEN_S, CLOSE_S, OPEN_D, CLOSE_D = "<<OPEN_S>>", "<<CLOSE_S>>", "<<OPEN_D>>", "<<CLOSE_D>>"
-        t = (text.replace("‘", OPEN_S)
-                 .replace("’", CLOSE_S)
-                 .replace("“", OPEN_D)
-                 .replace("”", CLOSE_D))
-        t = re.sub(r'(?<=\\w)'+re.escape(CLOSE_S)+r'(?=\\w)', APOS, t)
-        for w in ("em","cause","til","tis","twas","sup","round","clock"):
-            t = re.sub(r'\\b'+re.escape(CLOSE_S)+w+r'\\b', APOS+w, t, flags=re.IGNORECASE)
-        t = re.sub(re.escape(CLOSE_S)+r'(?=\\d{2}s\\b)', APOS, t)
-        t = (t.replace(OPEN_S,"“").replace(CLOSE_S,"”").replace(OPEN_D,"‘").replace(CLOSE_D,"’"))
-        text = t
-    else:
-        def smarten_line(line: str) -> str:
-            out, open_d = [], True
-            for ch in line:
-                if ch == '"':
-                    out.append("“" if open_d else "”"); open_d = not open_d
-                elif ch == "'":
-                    out.append("’")
-                else:
-                    out.append(ch)
-            return "".join(out)
-        text = "\\n".join(smarten_line(ln) for ln in text.split("\\n"))
+    # Convert dumb quotes to smart US if present
+    def smarten_line(line: str) -> str:
+        out, open_d = [], True
+        for ch in line:
+            if ch == '"':
+                out.append("“" if open_d else "”"); open_d = not open_d
+            elif ch == "'":
+                out.append("’")
+            else:
+                out.append(ch)
+        return "".join(out)
+    text = "\\n".join(smarten_line(ln) for ln in text.split("\\n"))
     return text.replace(APOS, "’")
 
 def convert_docx_runs_to_us(doc: Document) -> None:
@@ -132,7 +101,7 @@ def _remove_global_shapes_all_parts(doc: Document) -> None:
                 if parent is not None:
                     parent.remove(p)
 
-# === Drop-cap reconstruction (replacement) ===
+# === Drop-cap reconstruction (single replacement implementation) ===
 def _median_font_size(p):
     sizes = []
     for r in p.runs:
@@ -141,12 +110,12 @@ def _median_font_size(p):
     return sorted(sizes)[len(sizes)//2] if sizes else None
 
 def _detect_dropcap(paras, start_idx=0):
-    # Mode A: paragraph begins with 'X ' (letter + space)
+    # Case A: paragraph begins with 'X ' (letter + space)
     for j in range(start_idx, min(start_idx+6, len(paras))):
         txt = (paras[j].text or "").lstrip()
         if re.match(r'^[A-Z]\\s\\S', txt):
-            return j, txt[0].upper()
-    # Mode B: oversized single-letter run
+            return j, txt[0].upper(), 'A'
+    # Case B: oversized single-letter run
     for j in range(start_idx, min(start_idx+6, len(paras))):
         p = paras[j]
         if not p.runs:
@@ -160,8 +129,8 @@ def _detect_dropcap(paras, start_idx=0):
         if len(t) == 1 and t.isalpha():
             size = (r.font.size.pt if r.font.size else med or 0)
             if size >= max(20, 1.6*(med or 12)):
-                return j, t.upper()
-    return None, None
+                return j, t.upper(), 'B'
+    return None, None, None
 
 def _strip_leading_same_letter(text, letter):
     if not text:
@@ -178,7 +147,7 @@ def _strip_leading_same_letter(text, letter):
 def reconstruct_dropcap_block(paras, start_window=10, max_lines=4):
     if not paras:
         return False
-    idx, letter = _detect_dropcap(paras, 0)
+    idx, letter, mode = _detect_dropcap(paras, 0)
     if letter is None:
         return False
 
@@ -186,7 +155,7 @@ def reconstruct_dropcap_block(paras, start_window=10, max_lines=4):
     j = idx
 
     first_txt = (paras[idx].text or "").strip()
-    if re.match(r'^[A-Z]\\s\\S', first_txt):
+    if mode == 'A':
         lines.append(first_txt)
         line_idxs.append(idx)
         j = idx + 1
@@ -197,7 +166,7 @@ def reconstruct_dropcap_block(paras, start_window=10, max_lines=4):
         t = (paras[j].text or "").strip()
         if not t:
             j += 1; continue
-        # Skip short all-caps headings without punctuation (e.g., TOC/headers)
+        # Skip short all-caps headings without punctuation
         if len(t) <= 50 and t.isupper() and not re.search(r'[.!?…]', t):
             j += 1; continue
         if len(t) <= 180:
@@ -228,6 +197,46 @@ def reconstruct_dropcap_block(paras, start_window=10, max_lines=4):
 
     return True
 
+# === Small-caps block fronting (bring ALL-CAPS name block to start) ===
+_CAP_WORD = r'(?:[A-Z][A-Z]+)'
+_CAP_JOIN = r'(?:\\s+(?:OF|THE|AND|IN|AT|ON)\\s+|' \
+            r'\\s+)'  # allow connectors
+_CAP_SEQ = rf'{_CAP_WORD}(?:{_CAP_JOIN}{_CAP_WORD}){{0,5}}'
+
+def front_smallcaps_name(paras, scan_paras=10):
+    """If an ALL-CAPS name block appears early but not at start, move it to the front,
+    keeping the rest of the sentence, then append the initial fragment after it.
+    Also fixes a missing space in patterns like 'THEELEVENTH' -> 'THE ELEVENTH'.
+    """
+    # find the first non-empty paragraph
+    idx = next((i for i, p in enumerate(paras[:scan_paras]) if (p.text or '').strip()), None)
+    if idx is None:
+        return False
+    txt = (paras[idx].text or '').strip()
+
+    # regex search for a caps block not at the very start
+    m = re.search(rf'(?<!^)\b({_CAP_SEQ})\b', txt)
+    if not m:
+        return False
+
+    block = m.group(1)
+
+    # fix missing space THEELEVENTH -> THE ELEVENTH within block
+    block = re.sub(r'\\bTHE([A-Z])', r'THE \\1', block)
+
+    before = txt[:m.start()].strip()
+    after  = txt[m.end():].strip()
+
+    # If line starts lowercase and we have a meaningful caps block, front it
+    if before and before[0].islower():
+        new_txt = (block + ' ' + after + ' ' + before).strip()
+        # collapse double spaces
+        new_txt = re.sub(r'\\s{2,}', ' ', new_txt)
+        paras[idx].text = new_txt
+        return True
+
+    return False
+
 def convert_docx_bytes_to_us(docx_bytes: bytes) -> bytes:
     if Document is None:
         raise RuntimeError("python-docx required.")
@@ -253,12 +262,14 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes, fix_dropcaps: bool=True) 
         _remove_global_shapes_all_parts(doc)
 
         paras = doc.paragraphs
+        # cleanup placeholders/NBSP/form feed
         for i, p in enumerate(paras):
             for r in p.runs:
                 if r.text:
                     r.text = (r.text.replace("\\uFFFC","")
                                    .replace("\\u00A0"," ")
                                    .replace("\\u000c",""))
+        # collapse only unintended page-join blanks
         for i, p in enumerate(paras):
             if p.text.strip() in {"", "\\u00A0"} and 0 < i < len(paras)-1:
                 prev = paras[i-1].text.strip()
@@ -268,12 +279,13 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes, fix_dropcaps: bool=True) 
 
         if fix_dropcaps:
             reconstruct_dropcap_block(doc.paragraphs, start_window=10, max_lines=4)
+            front_smallcaps_name(doc.paragraphs, scan_paras=10)
 
         convert_docx_runs_to_us(doc)
 
         buf = io.BytesIO(); doc.save(buf); return buf.getvalue()
 
-st.set_page_config(page_title="Quote Style Converter (Drop-cap v6)", page_icon="📝", layout="centered")
+st.set_page_config(page_title="Quote Style Converter (Drop-cap v7)", page_icon="📝", layout="centered")
 
 CSS = """
 :root { --primary-color:#008080;--primary-hover:#006666;--bg-1:#0b0f14;--bg-2:#11161d;
@@ -295,8 +307,8 @@ body{font-family:Avenir,sans-serif;line-height:1.65;}
 """
 st.markdown("<style>\\n"+CSS+"\\n</style>", unsafe_allow_html=True)
 
-st.title("Quote Style Converter (pdf2docx – Drop-cap v6)")
-st.caption("PDF→DOCX with US quotes, global square cleanup, and replaced multi-line drop-cap reconstruction.")
+st.title("Quote Style Converter (pdf2docx – Drop-cap v7)")
+st.caption("PDF→DOCX with US quotes, deep square cleanup, and corrected drop-cap + small-caps ordering.")
 
 with st.container():
     mode = st.radio("Choose input type", ["DOCX → DOCX (UK → US)", "PDF → DOCX (pdf2docx → US quotes)"])
