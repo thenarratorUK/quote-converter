@@ -10,108 +10,241 @@ try:
     from pdf2docx import Converter as PDF2DOCXConverter
 except Exception:
     PDF2DOCXConverter = None
-def _pt_value(val, fallback=None):
-    try:
-        if val is None:
-            return fallback
-        return float(val.pt) if hasattr(val, "pt") else float(val)
-    except Exception:
-        return fallback
 
-def _run_font_size_pt(run, para):
-    sz = _pt_value(getattr(run.font, "size", None))
+
+
+def _run_size_pt(run, para, default=11.0):
+    def _pt(x):
+        try:
+            return float(x.pt) if hasattr(x, "pt") else (float(x) if x is not None else None)
+        except Exception:
+            return None
+    sz = _pt(getattr(run.font, "size", None))
     if sz is not None:
         return sz
     try:
-        psz = _pt_value(para.style.font.size)
+        psz = _pt(para.style.font.size)
         if psz is not None:
             return psz
     except Exception:
         pass
-    return 11.0
+    return default
 
-def _iter_alpha_chars(paragraph):
+def _alpha_positions_with_sizes(paragraph):
     for ri, run in enumerate(paragraph.runs):
         t = run.text or ""
         if not t:
             continue
-        size_pt = _run_font_size_pt(run, paragraph)
+        size = _run_size_pt(run, paragraph)
         for ci, ch in enumerate(t):
             if ch.isalpha():
-                yield ri, ci, ch, size_pt
+                yield ri, ci, ch, size
 
-def _majority_font_size_pt(doc) -> float:
-    sizes = []
-    for p in doc.paragraphs:
-        for ri, ci, ch, sz in _iter_alpha_chars(p):
-            sizes.append(sz)
-    if not sizes:
-        return 11.0
-    try:
-        import statistics as _stats
-        return float(_stats.median(sizes))
-    except Exception:
-        return sum(sizes) / len(sizes)
+def fix_dropcap_reordering_strict(doc):
+    """
+    Same ABCDEFG -> AE C G reordering as fix_dropcap_reordering, but guarded by a font-size check:
+    Only trigger when the *first alphabetic char in the initial paragraph* is >= 1.5× the size of the *next* alphabetic char in the document flow.
+    """
+    paras = list(doc.paragraphs)
+    i = 0
+    while i < len(paras):
+        p = paras[i]
+        t = p.text or ""
 
-def _remove_char_from_run(paragraph, run_idx, char_idx):
-    run = paragraph.runs[run_idx]
-    t = run.text or ""
-    run.text = t[:char_idx] + t[char_idx+1:]
-
-def _first_nonspace_pos(paragraph):
-    for ri, run in enumerate(paragraph.runs):
-        t = run.text or ""
-        for ci, ch in enumerate(t):
-            if not ch.isspace():
-                return ri, ci
-    return None
-
-def _strip_leading_spaces(paragraph):
-    for ri, run in enumerate(paragraph.runs):
-        t = run.text or ""
-        if t.strip("") == "":
-            paragraph.runs[ri].text = ""
-        else:
-            paragraph.runs[ri].text = (t.lstrip() if t else t)
+        # Identify the first alphabetic char position in paragraph i and its size
+        first_alpha = None
+        for ri, ci, ch, sz in _alpha_positions_with_sizes(p):
+            first_alpha = (ri, ci, ch, sz)
             break
-
-def fix_drop_caps_in_docx(doc):
-    majority = _majority_font_size_pt(doc)
-    X = 1.5 * majority
-
-    for p in doc.paragraphs:
-        if not p.runs:
+        if first_alpha is None:
+            i += 1
             continue
-        chars = list(_iter_alpha_chars(p))
-        if not chars:
-            continue
-        for idx, (ri, ci, ch, sz) in enumerate(chars):
-            if sz < X:
-                continue
-            if not ch.isalpha():
-                continue
-            run_t = p.runs[ri].text or ""
-            visible = [c for c in run_t if not c.isspace()]
-            if len(visible) != 1:
-                continue
-            if idx + 1 < len(chars):
-                ri2, ci2, ch2, sz2 = chars[idx+1]
-            else:
-                continue
-            if sz2 < sz and sz2 < X:
-                _remove_char_from_run(p, ri, ci)
-                pos = _first_nonspace_pos(p)
-                cap = ch.upper()
-                if pos is None:
-                    p.add_run(cap)
-                else:
-                    r0_idx, c0_idx = pos
-                    r0 = p.runs[r0_idx]
-                    t0 = r0.text or ""
-                    _strip_leading_spaces(p)
-                    r0.text = cap + (t0.lstrip() if t0 else "")
+
+        ri0, ci0, Achar, Asz = first_alpha
+
+        # Gather the next alphabetic char in the *document flow* (same paragraph after A, or subsequent paragraphs)
+        next_alpha = None
+        # First: same paragraph, after ci0
+        for ri, ci, ch, sz in _alpha_positions_with_sizes(p):
+            if (ri > ri0) or (ri == ri0 and ci > ci0):
+                next_alpha = (ri, ci, ch, sz)
                 break
+        # If not found, look ahead across following paragraphs
+        if next_alpha is None:
+            for j in range(i + 1, len(paras)):
+                for ri, ci, ch, sz in _alpha_positions_with_sizes(paras[j]):
+                    next_alpha = (ri, ci, ch, sz)
+                    break
+                if next_alpha is not None:
+                    break
+        if next_alpha is None:
+            i += 1
+            continue
+
+        _, _, _, Bsz = next_alpha
+
+        # Size guard: A must be >= 1.5× B to qualify
+        if Asz < 1.5 * Bsz:
+            i += 1
+            continue
+
+        # Validate local paragraph layout: paragraph i should begin with A + space + rest-of-line (C)
+        # We won't rely only on regex; we reconstruct C by slicing text from the first visible non-space char after A
+        # However, to avoid being too invasive, require that the very first visible glyph is Achar and a following space exists nearby.
+        starts_ok = False
+        visible_seen = 0
+        for ch in (p.text or ""):
+            if not ch.isspace():
+                visible_seen += 1
+                if visible_seen == 1 and ch == Achar:
+                    starts_ok = True
+                break
+        if not starts_ok:
+            i += 1
+            continue
+
+        # Extract C string: from the first non-space char after the *first visible run char* (not strictly after ci0, but good-enough for split shapes)
+        # We'll parse as: leading single glyph + optional spaces + remainder -> C
+        mt = re.match(r'^([^\S\r\n]*)([A-Za-z])( +)(.+)$', p.text or "")
+        if not mt:
+            i += 1
+            continue
+        # groups: lead_ws, A, space, C
+        C = mt.group(4).strip()
+
+        # Detect gap D: one or more empty paragraphs immediately following
+        j = i + 1
+        had_gap = False
+        while j < len(paras) and (paras[j].text or "").strip() == "":
+            had_gap = True
+            j += 1
+        if not had_gap or j >= len(paras):
+            i += 1
+            continue
+
+        # E = first non-empty after the gap
+        E = (paras[j].text or "").strip()
+
+        # G = next non-empty after E (skip any additional empties)
+        k = j + 1
+        while k < len(paras) and (paras[k].text or "").strip() == "":
+            k += 1
+        if k >= len(paras):
+            i += 1
+            continue
+        G = (paras[k].text or "").strip()
+
+        # Construct AE C G (no space between A and E)
+        new_text = (Achar.upper() + E).strip()
+        if C:
+            new_text += " " + C
+        if G:
+            new_text += " " + G
+
+        # Replace paragraphs i..k with a single paragraph containing new_text
+        p.text = new_text
+        # Remove paras i+1..k at XML level
+        for _ in range(k - i):
+            try:
+                nxt = p._element.getnext()
+                if nxt is not None:
+                    p._element.getparent().remove(nxt)
+            except Exception:
+                break
+
+        paras = list(doc.paragraphs)
+        i += 1
+
     return doc
+
+def fix_dropcap_reordering_strict(doc):
+    """
+    Heuristic for PDF->DOCX line misordering caused by drop caps.
+    Pattern described by user:
+      A = single larger letter (captured in first paragraph as a single letter + space prefix)
+      B = space after it
+      C = following text (continuation of first paragraph after "A ")
+      D = a gap (one or more empty paragraphs)
+      E = the sentence that actually belongs immediately after the drop cap
+      F = a newline / next line break (typically next paragraph)
+      G = the following line
+    Transform:
+      ABCDEFG  ->  A+E + " " + C + " " + G
+    Implementation assumptions:
+      - A and C are in paragraph i, with text starting "^[A-Za-z]\\s+..."
+      - D are one or more empty paragraphs i+1..j-1
+      - E is the first non-empty paragraph at index j
+      - G is the first non-empty paragraph at index k > j (skipping any further empty paragraphs)
+    The function replaces paragraphs [i..k] with a single paragraph "AE C G".
+    """
+    paras = list(doc.paragraphs)
+    i = 0
+    while i < len(paras):
+        p = paras[i]
+        t = p.text or ""
+        m = re.match(r'^([A-Za-z])\s+(.+)$', t)
+        if not m:
+            i += 1
+            continue
+
+        A = m.group(1)
+        C = m.group(2).strip()
+
+        # Find first non-empty paragraph after optional gap(s)
+        j = i + 1
+        had_gap = False
+        while j < len(paras) and (paras[j].text or "").strip() == "":
+            had_gap = True
+            j += 1
+
+        if j >= len(paras):
+            i += 1
+            continue
+
+        E = (paras[j].text or "").strip()
+
+        # Find next non-empty after E (skip additional gaps)
+        k = j + 1
+        while k < len(paras) and (paras[k].text or "").strip() == "":
+            k += 1
+        if k >= len(paras):
+            i += 1
+            continue
+
+        G = (paras[k].text or "").strip()
+
+        # We only apply if we actually observed a gap D; this reduces false positives
+        if not had_gap:
+            i += 1
+            continue
+
+        # Construct new paragraph text
+        new_text = (A + E).strip()  # AE, no space between A and E
+        if C:
+            new_text += " " + C
+        if G:
+            new_text += " " + G
+
+        # Replace paragraphs i..k with a single paragraph containing new_text
+        p.text = new_text
+        # Remove paragraphs i+1..k from the document
+        for _ in range(k - i):
+            # Note: python-docx requires removing from the underlying XML
+            # We'll remove the next sibling paragraph element
+            try:
+                nxt = p._element.getnext()
+                if nxt is not None:
+                    p._element.getparent().remove(nxt)
+            except Exception:
+                break
+
+        # Refresh local reference to paragraphs by re-snapshotting (structure changed)
+        paras = list(doc.paragraphs)
+        # Move past the modified paragraph
+        i += 1
+
+    return doc
+
 
 
 _ASCII_CTRL = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')
@@ -243,7 +376,7 @@ def convert_docx_bytes_to_us(docx_bytes: bytes) -> bytes:
     if Document is None:
         raise RuntimeError("python-docx required.")
     doc = Document(io.BytesIO(docx_bytes))
-    fix_drop_caps_in_docx(doc)
+    fix_dropcap_reordering_strict(doc)
     convert_docx_runs_to_us(doc)
     out = io.BytesIO(); doc.save(out)
     return out.getvalue()
@@ -261,7 +394,7 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
         cv.convert(out_path, start=0, end=None)
         cv.close()
         doc = Document(out_path)
-        fix_drop_caps_in_docx(doc)
+        fix_dropcap_reordering_strict(doc)
 
         # 1) Deep removal across all parts (fix persistent squares)
         _remove_global_shapes_all_parts(doc)
