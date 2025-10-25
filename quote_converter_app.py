@@ -1,5 +1,134 @@
 import io, os, re, tempfile, streamlit as st
 
+
+# === ACBD drop-cap fixer (internal logic; no UI changes) ===
+# Pattern:
+#   A = single big glyph run (≥1.5× paragraph median size), usually letter + space
+#   B = subsequent normal-sized runs (same paragraph) until C-start
+#   C = runs starting at the first ALL-CAPS word (same paragraph), and logically ending before the next paragraph that has <w:widowControl/>
+#   D = the next paragraph (which has <w:widowControl/>)
+# Reorder paragraph text to: A + C + " " + B (leave D untouched). Multi-pass until stable.
+import statistics as _acbd_stats
+
+def _acbd_pt(val, default=None):
+    try:
+        return float(val.pt) if hasattr(val, "pt") else (float(val) if val is not None else default)
+    except Exception:
+        return default
+
+def _acbd_run_size_pt(run, para, default=11.0):
+    sz = _acbd_pt(getattr(run.font, "size", None))
+    if sz is not None:
+        return sz
+    try:
+        psz = _acbd_pt(para.style.font.size, None)
+        if psz is not None:
+            return psz
+    except Exception:
+        pass
+    return default
+
+def _acbd_run_text(run):
+    try:
+        return "".join(t.text or "" for t in run._element.xpath(".//w:t", namespaces=run._element.nsmap))
+    except Exception:
+        return getattr(run, "text", "") or ""
+
+def _acbd_first_word(s):
+    import re as _re
+    m = _re.search(r"[A-Za-z]+", s or "")
+    return m.group(0) if m else ""
+
+def _acbd_is_all_caps_word(w):
+    return len(w) >= 2 and w.isalpha() and w.upper() == w
+
+def _acbd_para_has_widowcontrol(para):
+    try:
+        el = para._element
+        return bool(el.xpath(".//w:pPr/w:widowControl", namespaces=el.nsmap))
+    except Exception:
+        return False
+
+def _acbd_fix_once_in_paragraph(doc, p_index):
+    paras = doc.paragraphs
+    if p_index < 0 or p_index >= len(paras):
+        return False
+    p = paras[p_index]
+    runs = list(p.runs)
+    if not runs:
+        return False
+
+    sizes = [_acbd_run_size_pt(r, p) for r in runs]
+    vals = [v for v in sizes if v is not None]
+    if not vals:
+        return False
+    try:
+        majority = float(_acbd_stats.median(vals))
+    except Exception:
+        majority = sum(vals)/len(vals)
+    threshold = 1.5 * majority
+
+    # A: first run that's a single alphabetic glyph (optionally with space) and large
+    A_idx = None
+    A_char = None
+    for i, r in enumerate(runs):
+        txt = _acbd_run_text(r)
+        alpha = [ch for ch in txt if ch.isalpha()]
+        if len(alpha) == 1 and sizes[i] is not None and sizes[i] >= threshold:
+            A_idx = i
+            A_char = alpha[0]
+            break
+    if A_idx is None:
+        return False
+
+    # C-start: first run after A whose FIRST WORD is ALL-CAPS
+    C_start = None
+    for j in range(A_idx+1, len(runs)):
+        fw = _acbd_first_word(_acbd_run_text(runs[j]))
+        if _acbd_is_all_caps_word(fw):
+            C_start = j
+            break
+    if C_start is None:
+        return False
+
+    # Next paragraph must exist and have widowControl (terminates C; D begins there)
+    if p_index + 1 >= len(paras):
+        return False
+    if not _acbd_para_has_widowcontrol(paras[p_index+1]):
+        return False
+
+    # B: text between A+1 and C_start
+    B_text = "".join(_acbd_run_text(runs[t]) for t in range(A_idx+1, C_start)).strip()
+    # C: text from C_start to end of this paragraph
+    C_text = "".join(_acbd_run_text(runs[t]) for t in range(C_start, len(runs))).strip()
+    if not B_text or not C_text:
+        return False
+
+    # New paragraph text: A + C + " " + B  (no space between A and start of C)
+    new_text = (A_char.upper() + C_text).strip()
+    if B_text:
+        new_text += " " + B_text
+
+    if new_text and new_text != (p.text or "").strip():
+        p.text = new_text
+        return True
+    return False
+
+def fix_dropcaps_acbd(doc, max_passes=50):
+    passes = 0
+    while passes < max_passes:
+        changes = 0
+        for i in range(len(doc.paragraphs)):
+            if _acbd_fix_once_in_paragraph(doc, i):
+                changes += 1
+        if changes == 0:
+            break
+        passes += 1
+    return doc
+# === end ACBD fixer ===
+
+
+
 try:
     from docx import Document
 except Exception:
@@ -311,130 +440,3 @@ if uploaded is not None:
                     st.error(f"Conversion failed: {e}")
         else:
             st.error("Unsupported file type. Please upload a .docx or .pdf.")
-
-
-# === ACBD drop-cap fixer (internal logic; no UI changes) ===
-# Pattern:
-#   A = single big glyph run (≥1.5× paragraph median size), usually letter + space
-#   B = subsequent normal-sized runs (same paragraph) until C-start
-#   C = runs starting at the first ALL-CAPS word (same paragraph), and logically ending before the next paragraph that has <w:widowControl/>
-#   D = the next paragraph (which has <w:widowControl/>)
-# Reorder paragraph text to: A + C + " " + B (leave D untouched). Multi-pass until stable.
-def _acbd_pt(val, default=None):
-    try:
-        return float(val.pt) if hasattr(val, "pt") else (float(val) if val is not None else default)
-    except Exception:
-        return default
-
-def _acbd_run_size_pt(run, para, default=11.0):
-    sz = _acbd_pt(getattr(run.font, "size", None))
-    if sz is not None:
-        return sz
-    try:
-        psz = _acbd_pt(para.style.font.size, None)
-        if psz is not None:
-            return psz
-    except Exception:
-        pass
-    return default
-
-def _acbd_run_text(run):
-    try:
-        return "".join(t.text or "" for t in run._element.xpath(".//w:t", namespaces=run._element.nsmap))
-    except Exception:
-        # Fallback: python-docx run.text only returns the first text node; try best-effort
-        return getattr(run, "text", "") or ""
-
-def _acbd_first_word(s):
-    import re as _re
-    m = _re.search(r"[A-Za-z]+", s or "")
-    return m.group(0) if m else ""
-
-def _acbd_is_all_caps_word(w):
-    return len(w) >= 2 and w.isalpha() and w.upper() == w
-
-def _acbd_para_has_widowcontrol(para):
-    try:
-        el = para._element
-        return bool(el.xpath(".//w:pPr/w:widowControl", namespaces=el.nsmap))
-    except Exception:
-        return False
-
-def _acbd_fix_once_in_paragraph(doc, p_index):
-    paras = doc.paragraphs
-    if p_index < 0 or p_index >= len(paras):
-        return False
-    p = paras[p_index]
-    runs = list(p.runs)
-    if not runs:
-        return False
-
-    sizes = [_acbd_run_size_pt(r, p) for r in runs]
-    vals = [v for v in sizes if v is not None]
-    if not vals:
-        return False
-    try:
-        import statistics as _stats
-        majority = float(_stats.median(vals))
-    except Exception:
-        majority = sum(vals)/len(vals)
-    threshold = 1.5 * majority
-
-    # A: first run that's a single alphabetic glyph (optionally with space) and large
-    A_idx = None
-    A_char = None
-    for i, r in enumerate(runs):
-        txt = _acbd_run_text(r)
-        alpha = [ch for ch in txt if ch.isalpha()]
-        if len(alpha) == 1 and sizes[i] is not None and sizes[i] >= threshold:
-            A_idx = i
-            A_char = alpha[0]
-            break
-    if A_idx is None:
-        return False
-
-    # C-start: first run after A whose FIRST WORD is ALL-CAPS
-    C_start = None
-    for j in range(A_idx+1, len(runs)):
-        fw = _acbd_first_word(_acbd_run_text(runs[j]))
-        if _acbd_is_all_caps_word(fw):
-            C_start = j
-            break
-    if C_start is None:
-        return False
-
-    # Next paragraph must exist and have widowControl (terminates C; D begins there)
-    if p_index + 1 >= len(paras):
-        return False
-    if not _acbd_para_has_widowcontrol(paras[p_index+1]):
-        return False
-
-    # B: text between A+1 and C_start
-    B_text = "".join(_acbd_run_text(runs[t]) for t in range(A_idx+1, C_start)).strip()
-    # C: text from C_start to end of this paragraph
-    C_text = "".join(_acbd_run_text(runs[t]) for t in range(C_start, len(runs))).strip()
-    if not B_text or not C_text:
-        return False
-
-    # New paragraph text: A + C + " " + B  (no space between A and start of C)
-    new_text = (A_char.upper() + C_text).strip()
-    if B_text:
-        new_text += " " + B_text
-
-    if new_text and new_text != (p.text or "").strip():
-        p.text = new_text
-        return True
-    return False
-
-def fix_dropcaps_acbd(doc, max_passes=50):
-    passes = 0
-    while passes < max_passes:
-        changes = 0
-        for i in range(len(doc.paragraphs)):
-            if _acbd_fix_once_in_paragraph(doc, i):
-                changes += 1
-        if changes == 0:
-            break
-        passes += 1
-    return doc
-# === end ACBD fixer ===
