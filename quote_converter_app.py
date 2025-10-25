@@ -1,14 +1,20 @@
 import io, os, re, tempfile, streamlit as st
 
 
-# === ACBD drop-cap fixer (internal logic; no UI changes) ===
-# Pattern:
-#   A = single big glyph run (≥1.5× paragraph median size), usually letter + space
-#   B = subsequent normal-sized runs (same paragraph) until C-start
-#   C = runs starting at the first ALL-CAPS word (same paragraph), and logically ending before the next paragraph that has <w:widowControl/>
-#   D = the next paragraph (which has <w:widowControl/>)
-# Reorder paragraph text to: A + C + " " + B (leave D untouched). Multi-pass until stable.
+# === ACBD drop-cap fixer (refined, PDF->DOCX only; no UI changes) ===
+# Rules per user:
+#  • A = single large glyph (≥ 1.5× paragraph median size), usually letter + space.
+#  • B = subsequent normal-size runs after A up to C-start.
+#  • C = starts at the first ALL-CAPS word (≥2 letters), which may be split across runs
+#         and may occur in the same or later paragraphs; C continues until a paragraph
+#         that contains <w:widowControl/> is encountered (exclusive).
+#  • D = the widowControl paragraph (left untouched).
+#  • Reorder: current paragraph text becomes A + C + " " + B. Repeat until stable.
+# Diagnostics: set ACBD_DIAG = True for per-paragraph prints.
+ACBD_DIAG = False
+
 import statistics as _acbd_stats
+import re as _acbd_re
 
 def _acbd_pt(val, default=None):
     try:
@@ -17,10 +23,21 @@ def _acbd_pt(val, default=None):
         return default
 
 def _acbd_run_size_pt(run, para, default=11.0):
+    # Prefer python-docx size if present; else pull from XML (<w:sz w:val=".."> half-points)
     sz = _acbd_pt(getattr(run.font, "size", None))
     if sz is not None:
         return sz
     try:
+        # Fallback to run XML
+        el = run._element
+        vals = el.xpath(".//w:rPr/w:sz/@w:val", namespaces=el.nsmap)
+        if vals:
+            try:
+                # .docx stores half-points in w:val; convert to points
+                return float(vals[0]) / 2.0
+            except Exception:
+                pass
+        # Fallback to paragraph style
         psz = _acbd_pt(para.style.font.size, None)
         if psz is not None:
             return psz
@@ -29,25 +46,71 @@ def _acbd_run_size_pt(run, para, default=11.0):
     return default
 
 def _acbd_run_text(run):
+    # Concatenate all <w:t> in this run
     try:
         return "".join(t.text or "" for t in run._element.xpath(".//w:t", namespaces=run._element.nsmap))
     except Exception:
         return getattr(run, "text", "") or ""
 
-def _acbd_first_word(s):
-    import re as _re
-    m = _re.search(r"[A-Za-z]+", s or "")
-    return m.group(0) if m else ""
-
-def _acbd_is_all_caps_word(w):
-    return len(w) >= 2 and w.isalpha() and w.upper() == w
+def _acbd_first_caps_token_across_runs(doc, start_para, start_run):
+    """
+    Scan (para,run) sequence starting at (start_para,start_run) to find earliest ALL-CAPS token (>=2 letters).
+    Allows tokens split across adjacent runs.
+    Returns (para_index, run_index, char_offset_in_run) for the token start, or None.
+    """
+    paras = doc.paragraphs
+    token = ""
+    started = False
+    for pi in range(start_para, len(paras)):
+        runs = paras[pi].runs
+        ri0 = start_run if pi == start_para else 0
+        for ri in range(ri0, len(runs)):
+            txt = _acbd_run_text(runs[ri])
+            # Consume characters and identify token boundaries
+            for ci, ch in enumerate(txt):
+                if ch.isalpha():
+                    if not started:
+                        # potential start
+                        token = ch
+                        start_loc = (pi, ri, ci)
+                        started = True
+                    else:
+                        token += ch
+                else:
+                    # boundary reached
+                    if started and len(token) >= 2 and token.upper() == token:
+                        return start_loc
+                    token = ""
+                    started = False
+            # End of run boundary acts like a separator; evaluate token so far
+            if started and len(token) >= 2 and token.upper() == token:
+                return start_loc
+            # else continue into next run
+    return None
 
 def _acbd_para_has_widowcontrol(para):
     try:
         el = para._element
-        return bool(el.xpath(".//w:pPr/w:widowControl", namespaces=el.nsmap))
+        return bool(el.xpath(".//w:widowControl", namespaces=el.nsmap))
     except Exception:
         return False
+
+def _acbd_find_widowcontrol_forward(doc, start_para):
+    """Return index of first paragraph >= start_para that contains <w:widowControl/>, else None."""
+    for pi in range(start_para, len(doc.paragraphs)):
+        if _acbd_para_has_widowcontrol(doc.paragraphs[pi]):
+            return pi
+    return None
+
+def _acbd_para_median_size(para):
+    sizes = [_acbd_run_size_pt(r, para) for r in para.runs]
+    sizes = [s for s in sizes if s is not None]
+    if not sizes:
+        return 11.0
+    try:
+        return float(_acbd_stats.median(sizes))
+    except Exception:
+        return sum(sizes)/len(sizes)
 
 def _acbd_fix_once_in_paragraph(doc, p_index):
     paras = doc.paragraphs
@@ -58,74 +121,95 @@ def _acbd_fix_once_in_paragraph(doc, p_index):
     if not runs:
         return False
 
-    sizes = [_acbd_run_size_pt(r, p) for r in runs]
-    vals = [v for v in sizes if v is not None]
-    if not vals:
-        return False
-    try:
-        majority = float(_acbd_stats.median(vals))
-    except Exception:
-        majority = sum(vals)/len(vals)
+    majority = _acbd_para_median_size(p)
     threshold = 1.5 * majority
 
-    # A: first run that's a single alphabetic glyph (optionally with space) and large
+    # A: first run with exactly one alphabetic glyph and size >= threshold
     A_idx = None
     A_char = None
     for i, r in enumerate(runs):
         txt = _acbd_run_text(r)
         alpha = [ch for ch in txt if ch.isalpha()]
-        if len(alpha) == 1 and sizes[i] is not None and sizes[i] >= threshold:
+        sz = _acbd_run_size_pt(r, p, default=majority)
+        if len(alpha) == 1 and sz is not None and sz >= threshold:
             A_idx = i
             A_char = alpha[0]
             break
     if A_idx is None:
+        if ACBD_DIAG: print(f"[ACBD] p={p_index}: no A (threshold={threshold:.1f}, median={majority:.1f})")
         return False
 
-    # C-start: first run after A whose FIRST WORD is ALL-CAPS
-    C_start = None
-    for j in range(A_idx+1, len(runs)):
-        fw = _acbd_first_word(_acbd_run_text(runs[j]))
-        if _acbd_is_all_caps_word(fw):
-            C_start = j
-            break
-    if C_start is None:
+    # Find C-start across runs/paragraphs; stop only if widowControl encountered before any ALL-CAPS
+    c_start_loc = _acbd_first_caps_token_across_runs(doc, p_index, A_idx+1)
+    wc_idx = _acbd_find_widowcontrol_forward(doc, p_index+1)
+    if wc_idx is not None and (c_start_loc is None or c_start_loc[0] >= wc_idx):
+        # widowControl reached before any ALL-CAPS start
+        if ACBD_DIAG: print(f"[ACBD] p={p_index}: widowControl@{wc_idx} before C-start; skip")
+        return False
+    if c_start_loc is None:
+        if ACBD_DIAG: print(f"[ACBD] p={p_index}: no C-start found in document tail; skip")
         return False
 
-    # Next paragraph must exist and have widowControl (terminates C; D begins there)
-    if p_index + 1 >= len(paras):
-        return False
-    if not _acbd_para_has_widowcontrol(paras[p_index+1]):
+    c_pi, c_ri, c_ci = c_start_loc
+
+    # Ensure we have a widowControl paragraph to terminate C
+    if wc_idx is None:
+        if ACBD_DIAG: print(f"[ACBD] p={p_index}: no widowControl found after; skip")
         return False
 
-    # B: text between A+1 and C_start
-    B_text = "".join(_acbd_run_text(runs[t]) for t in range(A_idx+1, C_start)).strip()
-    # C: text from C_start to end of this paragraph
-    C_text = "".join(_acbd_run_text(runs[t]) for t in range(C_start, len(runs))).strip()
+    # Build B
+    if c_pi == p_index:
+        B_text = "".join(_acbd_run_text(runs[t]) for t in range(A_idx+1, c_ri)).strip()
+    else:
+        B_text = "".join(_acbd_run_text(runs[t]) for t in range(A_idx+1, len(runs))).strip()
+
+    # Build C: from c_start_loc to end of c_pi paragraph, plus any full paragraphs until wc_idx (exclusive)
+    C_parts = []
+    # Start in c_pi at run c_ri; if token starts mid-run (c_ci>0), include from that character onward
+    c_runs = paras[c_pi].runs
+    start_txt = _acbd_run_text(c_runs[c_ri])
+    C_parts.append(start_txt[c_ci:] if c_ci < len(start_txt) else "")
+    for t in range(c_ri+1, len(c_runs)):
+        C_parts.append(_acbd_run_text(c_runs[t]))
+    # Intermediate paragraphs up to (but not including) wc_idx
+    for pi in range(c_pi+1, wc_idx):
+        C_parts.extend(_acbd_run_text(r) for r in paras[pi].runs)
+    C_text = "".join(C_parts).strip()
+
     if not B_text or not C_text:
+        if ACBD_DIAG: print(f"[ACBD] p={p_index}: empty B or C (B={len(B_text)}, C={len(C_text)}); skip")
         return False
 
-    # New paragraph text: A + C + " " + B  (no space between A and start of C)
+    # Recompose current paragraph only: A + C + " " + B
     new_text = (A_char.upper() + C_text).strip()
     if B_text:
         new_text += " " + B_text
 
-    if new_text and new_text != (p.text or "").strip():
+    if new_text != (p.text or "").strip():
+        if ACBD_DIAG:
+            print(f"[ACBD] p={p_index}: REORDERED | A='{A_char}' | B[:30]='{B_text[:30]}' | C[:30]='{C_text[:30]}' | wc@{wc_idx} c@({c_pi},{c_ri},{c_ci})")
         p.text = new_text
         return True
-    return False
+    else:
+        if ACBD_DIAG: print(f"[ACBD] p={p_index}: no change after recomposition")
+        return False
 
-def fix_dropcaps_acbd(doc, max_passes=50):
+def fix_dropcaps_acbd(doc, max_passes=80):
     passes = 0
     while passes < max_passes:
         changes = 0
         for i in range(len(doc.paragraphs)):
-            if _acbd_fix_once_in_paragraph(doc, i):
+            # Attempt multiple fixes per paragraph until stable
+            inner = 0
+            while inner < 6 and _acbd_fix_once_in_paragraph(doc, i):
                 changes += 1
+                inner += 1
+        if ACBD_DIAG: print(f"[ACBD] pass={passes} changes={changes}")
         if changes == 0:
             break
         passes += 1
     return doc
-# === end ACBD fixer ===
+# === end refined ACBD fixer ===
 
 
 
