@@ -1,8 +1,5 @@
+# quote_converter_app_pdf2docx_final_globclean_v3.py
 import io, os, re, tempfile, streamlit as st
-
-# Regex to remove ASCII control characters
-_ASCII_CTRL = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')
-
 
 try:
     from docx import Document
@@ -14,399 +11,7 @@ try:
 except Exception:
     PDF2DOCXConverter = None
 
-# === Drop-cap reorder heuristic (size-based, within a paragraph) ===
-def _dc_pt(val, default=None):
-    try:
-        return float(val.pt) if hasattr(val, "pt") else (float(val) if val is not None else default)
-    except Exception:
-        return default
-
-def _dc_run_size_pt(run, para, default=11.0):
-    sz = _dc_pt(getattr(run.font, "size", None))
-    if sz is not None:
-        return sz
-    try:
-        psz = _dc_pt(para.style.font.size, None)
-        if psz is not None:
-            return psz
-    except Exception:
-        pass
-    return default
-
-def _dc_has_tab_or_br(run):
-    try:
-        el = run._element
-        # Look for <w:tab/> or <w:br/>
-        return el.xpath(".//w:tab|.//w:br") != []
-    except Exception:
-        return False
-
-def _dc_median(vals):
-    vals = [v for v in vals if v is not None]
-    if not vals:
-        return 11.0
-    try:
-        import statistics as _stats
-        return float(_stats.median(vals))
-    except Exception:
-        return sum(vals)/len(vals)
-
-
-
-# === Unified drop-cap fixer: D (tab/br) optional, with lexical fallback for E; multi-pass across doc ===
-def _dc_pt(val, default=None):
-    try:
-        return float(val.pt) if hasattr(val, "pt") else (float(val) if val is not None else default)
-    except Exception:
-        return default
-
-def _dc_run_size_pt(run, para, default=11.0):
-    sz = _dc_pt(getattr(run.font, "size", None))
-    if sz is not None:
-        return sz
-    try:
-        psz = _dc_pt(para.style.font.size, None)
-        if psz is not None:
-            return psz
-    except Exception:
-        pass
-    return default
-
-def _dc_has_tab_or_br(run):
-    try:
-        el = run._element
-        # Look for <w:tab/> or <w:br/>
-        return bool(el.xpath(".//w:tab|.//w:br"))
-    except Exception:
-        return False
-
-def _dc_median(vals):
-    vals = [v for v in vals if v is not None]
-    if not vals:
-        return 11.0
-    try:
-        import statistics as _stats
-        return float(_stats.median(vals))
-    except Exception:
-        return sum(vals) / len(vals)
-
-def _dc_run_text(run):
-    # Concatenate all text nodes for this run
-    try:
-        return "".join(t.text or "" for t in run._element.xpath(".//w:t", namespaces=run._element.nsmap))
-    except Exception:
-        # Fallback via python-docx API
-        return "".join([getattr(t, "text", "") or "" for t in getattr(run, "text", "")])
-
-def _looks_like_sentence_start(s):
-    """Conservative heuristic for E when no gap: 
-    - starts with ALL CAPS word(s) (len>=2) followed by space, or
-    - starts with CapitalizedWord (A-Z then lowercase) and then lowercase/space/punct follows,
-    - disallow pure digits.
-    """
-    if not s:
-        return False
-    s_stripped = s.lstrip()
-    if not s_stripped:
-        return False
-    # Reject if first token starts with digit
-    if s_stripped[0].isdigit():
-        return False
-    # ALL-CAPS token(s) at start (at least 2 letters)
-    m_all = re.match(r'^[A-Z]{2,}(?:\s+[A-Z]{2,})*[\s,.;:!?-]', s_stripped)
-    if m_all:
-        return True
-    # Capitalized word at start
-    m_cap = re.match(r'^[A-Z][a-z][A-Za-z\'-]*', s_stripped)
-    if m_cap:
-        return True
-    return False
-
-def _collect_runs_text(runs, start, stop_pred):
-    """Collect text from runs[start:] until stop_pred(run_index) returns True (exclusive)."""
-    parts = []
-    j = start
-    while j < len(runs) and not stop_pred(j):
-        parts.append(_dc_run_text(runs[j]) or "")
-        j += 1
-    return "".join(parts), j
-
-def _fix_one_unified_in_paragraph(p):
-    """Apply unified drop-cap fix once in paragraph p; return True if changed.
-       This version can split E **inside** a run (mid-run), not only at run boundaries.
-    """
-    runs = list(p.runs)
-    if not runs:
-        return False
-
-    sizes = [_dc_run_size_pt(r, p) for r in runs]
-    median_sz = _dc_median(sizes)
-    threshold = 1.5 * median_sz
-
-    # Find candidate A: single alphabetic glyph (allow space) with size >= threshold
-    A_idx = None
-    A_char = None
-    for i, r in enumerate(runs):
-        txt = _dc_run_text(r)
-        alpha = [ch for ch in txt if ch.isalpha()]
-        if len(alpha) == 1 and sizes[i] is not None and sizes[i] >= threshold:
-            A_idx = i
-            A_char = alpha[0]
-            break
-    if A_idx is None:
-        return False
-
-    # Gather the tail (text after A) as both per-run fragments and a single concatenated string
-    tail_runs = runs[A_idx+1:]
-    tail_texts = [(_dc_run_text(r) or "") for r in tail_runs]
-    tail_concat = "".join(tail_texts)
-
-    # First try strict gap detection on run sequence
-    j = A_idx + 1
-    C_parts = []
-    while j < len(runs) and not _dc_has_tab_or_br(runs[j]):
-        C_parts.append(_dc_run_text(runs[j]) or "")
-        j += 1
-    has_gap = (j < len(runs) and _dc_has_tab_or_br(runs[j]))
-
-    if has_gap:
-        # As before: E is runs after the gap; G is remainder
-        k = j
-        while k < len(runs) and _dc_has_tab_or_br(runs[k]):
-            k += 1
-        E_parts = []
-        while k < len(runs) and not _dc_has_tab_or_br(runs[k]):
-            E_parts.append(_dc_run_text(runs[k]) or "")
-            k += 1
-        while k < len(runs) and _dc_has_tab_or_br(runs[k]):
-            k += 1
-        G_parts = [(_dc_run_text(runs[t]) or "") for t in range(k, len(runs))] if k < len(runs) else []
-        C_text = "".join(C_parts).strip()
-        E_text = "".join(E_parts).strip()
-        G_text = "".join(G_parts).strip()
-        if not C_text or not E_text:
-            return False
-    else:
-        # No explicit gap; find E *inside* the concatenated tail by lexical cues
-        def find_lexical_split(s):
-            # ALL CAPS token(s) span (>=2 letters), prefer earliest occurrence not at position 0
-            m = re.search(r'\b[A-Z]{2,}(?:\s+[A-Z]{2,})+\b', s)
-            if m and m.start() > 0:
-                return m.start()
-            # Capitalized word boundary anywhere after position 0
-            m2 = re.search(r'(?<!\w)([A-Z][a-z][A-Za-z\'-]*)', s)
-            if m2 and m2.start() > 0:
-                return m2.start()
-            return None
-
-        split_idx = find_lexical_split(tail_concat)
-        if split_idx is None:
-            return False
-
-        C_text = tail_concat[:split_idx].strip()
-        E_text = tail_concat[split_idx:].strip()
-        if not C_text or not E_text:
-            return False
-        G_text = ""
-
-    AE = (A_char.upper() + E_text).strip()
-    new_text = AE + ((" " + C_text) if C_text else "") + ((" " + G_text) if G_text else "")
-
-    if new_text.strip() and new_text.strip() != (p.text or "").strip():
-        p.text = new_text
-        return True
-    return False
-
-def fix_dropcaps_unified(doc, max_passes=50):
-    """Run as many passes as required until a full pass makes no changes (or max_passes reached)."""
-    passes = 0
-    while passes < max_passes:
-        changes = 0
-        for p in doc.paragraphs:
-            # Repeat within the paragraph until stable (covers multiple drop caps in one paragraph)
-            inner_loops = 0
-            while inner_loops < 8:
-                inner_loops += 1
-                if not _fix_one_unified_in_paragraph(p):
-                    break
-                changes += 1
-        if changes == 0:
-            break
-        passes += 1
-    return doc
-# === end unified drop-cap fixer ===
-
-def fix_dropcaps_unified(doc):
-    """
-    Multi-pass drop-cap reorder:
-      - Repeats scanning and fixing until no further changes are made in the document (max 8 passes).
-      - Each pass scans every paragraph and applies the size-based A/E/C/G reconstruction where the pattern is found.
-    """
-    MAX_PASSES = 8
-    for _ in range(MAX_PASSES):
-        changes = 0
-        for p in doc.paragraphs:
-            runs = list(p.runs)
-            if not runs:
-                continue
-
-            # Compute paragraph-level median size to adapt to local formatting
-            sizes = [ _dc_run_size_pt(r, p) for r in runs ]
-            median_sz = _dc_median(sizes)
-            threshold = 1.5 * median_sz
-
-            # Find candidate A
-            A_idx = None
-            A_char = None
-            for i, r in enumerate(runs):
-                t = r.text or ""
-                alpha_chars = [ch for ch in t if ch.isalpha()]
-                if len(alpha_chars) == 1 and sizes[i] is not None and sizes[i] >= threshold:
-                    A_idx = i
-                    A_char = alpha_chars[0]
-                    break
-            if A_idx is None:
-                continue
-
-            # Collect C until a tab/br
-            C_parts = []
-            j = A_idx + 1
-            saw_content = False
-            while j < len(runs) and not _dc_has_tab_or_br(runs[j]):
-                C_parts.append(runs[j].text or "")
-                if (runs[j].text or "").strip():
-                    saw_content = True
-                j += 1
-            if not saw_content:
-                continue
-
-            # Must have at least one tab/br (gap D)
-            d = j
-            if d >= len(runs) or not _dc_has_tab_or_br(runs[d]):
-                continue
-            while d < len(runs) and _dc_has_tab_or_br(runs[d]):
-                d += 1
-            if d >= len(runs):
-                continue
-
-            # E: next normal runs after gap
-            E_parts = []
-            k = d
-            saw_E = False
-            while k < len(runs) and not _dc_has_tab_or_br(runs[k]):
-                txt = runs[k].text or ""
-                if txt:
-                    E_parts.append(txt)
-                    if txt.strip():
-                        saw_E = True
-                k += 1
-            if not saw_E:
-                continue
-
-            # G: remainder after E (skip any gap markers)
-            while k < len(runs) and _dc_has_tab_or_br(runs[k]):
-                k += 1
-            G_parts = [ (r.text or "") for r in runs[k:] ] if k < len(runs) else []
-
-            AE = (A_char.upper() + "".join(E_parts)).strip()
-            C_text = " ".join(x.strip() for x in ["".join(C_parts)] if x.strip())
-            G_text = " ".join(x.strip() for x in ["".join(G_parts)] if x.strip())
-
-            new_text = AE
-            if C_text:
-                new_text += " " + C_text
-            if G_text:
-                new_text += " " + G_text
-
-            if new_text.strip() != (p.text or "").strip():
-                p.text = new_text
-                changes += 1
-
-        if changes == 0:
-            break
-    return doc
-
-
-def _fix_one_dropcap_occurrence(doc, start_idx=0):
-    """Scan paragraphs from start_idx and apply the size-based A/E/C/G rewrite to the first match found.
-       Returns (changed: bool, next_index: int)."""
-    paras = list(doc.paragraphs)
-    n = len(paras)
-    for pi in range(start_idx, n):
-        p = paras[pi]
-        runs = list(p.runs)
-        if not runs:
-            continue
-
-        sizes = [_dc_run_size_pt(r, p) for r in runs]
-        median_sz = _dc_median(sizes)
-        threshold = 1.5 * median_sz
-
-        # Candidate A
-        A_idx = None
-        A_char = None
-        for i, r in enumerate(runs):
-            t = r.text or ""
-            alpha_chars = [ch for ch in t if ch.isalpha()]
-            if len(alpha_chars) == 1 and sizes[i] is not None and sizes[i] >= threshold:
-                A_idx = i
-                A_char = alpha_chars[0]
-                break
-        if A_idx is None:
-            continue
-
-        # C segment: until tab/br
-        C_parts = []
-        j = A_idx + 1
-        saw_C = False
-        while j < len(runs) and not _dc_has_tab_or_br(runs[j]):
-            txt = runs[j].text or ""
-            C_parts.append(txt)
-            if txt.strip():
-                saw_C = True
-            j += 1
-        if not saw_C:
-            continue
-
-        # Gap D must exist
-        d = j
-        if d >= len(runs) or not _dc_has_tab_or_br(runs[d]):
-            continue
-        while d < len(runs) and _dc_has_tab_or_br(runs[d]):
-            d += 1
-        if d >= len(runs):
-            continue
-
-        # E segment
-        E_parts = []
-        k = d
-        saw_E = False
-        while k < len(runs) and not _dc_has_tab_or_br(runs[k]):
-            txt = runs[k].text or ""
-            if txt:
-                E_parts.append(txt)
-                if txt.strip():
-                    saw_E = True
-            k += 1
-        if not saw_E:
-            continue
-
-        # Skip any further gaps after E
-        while k < len(runs) and _dc_has_tab_or_br(runs[k]):
-            k += 1
-        G_parts = [(r.text or "") for r in runs[k:]] if k < len(runs) else []
-
-        # Build AE C G
-        AE = (A_char.upper() + "".join(E_parts)).strip()
-        C_text = " ".join(x.strip() for x in ["".join(C_parts)] if x.strip())
-        G_text = " ".join(x.strip() for x in ["".join(G_parts)] if x.strip())
-        new_text = AE + ((" " + C_text) if C_text else "") + ((" " + G_text) if G_text else "")
-
-        if new_text.strip() and new_text.strip() != (p.text or "").strip():
-            p.text = new_text
-            return True, pi + 1  # continue from next paragraph after a change
-    return False, n
-
+_ASCII_CTRL = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')
 
 def _drop_nonchars(s: str) -> str:
     out = []
@@ -535,8 +140,7 @@ def convert_docx_bytes_to_us(docx_bytes: bytes) -> bytes:
     if Document is None:
         raise RuntimeError("python-docx required.")
     doc = Document(io.BytesIO(docx_bytes))
-    fix_dropcaps_unified(doc)
-    fix_dropcaps_unified(doc)
+    fix_dropcaps_acbd(doc)
     convert_docx_runs_to_us(doc)
     out = io.BytesIO(); doc.save(out)
     return out.getvalue()
@@ -554,8 +158,7 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
         cv.convert(out_path, start=0, end=None)
         cv.close()
         doc = Document(out_path)
-        fix_dropcaps_unified(doc)
-        fix_dropcaps_unified(doc)
+        fix_dropcaps_acbd(doc)
 
         # 1) Deep removal across all parts (fix persistent squares)
         _remove_global_shapes_all_parts(doc)
@@ -581,149 +184,174 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
 
 st.set_page_config(page_title="Quote Style Converter (Global Clean v3)", page_icon="📝", layout="centered")
 
-CSS = """:root {
-  --primary-color: #008080;      /* Teal */
-  --primary-hover: #007070;
-  --background-color: #fdfdfd;
-  --text-color: #222222;
-  --card-background: #ffffff;
-  --card-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
-  --border-radius: 10px;
-  --font-family: 'Avenir', sans-serif;
-  --accent-color: #ff9900;
+CSS = """
+:root { --primary-color:#008080;--primary-hover:#006666;--bg-1:#0b0f14;--bg-2:#11161d;
+--card:#0f141a;--text-1:#e8eef5;--text-2:#b2c0cf;--muted:#8aa0b5;--accent:#e0f2f1;--ring:rgba(0,128,128,0.5);}
+html,body,[data-testid="stAppViewContainer"]{
+  background:linear-gradient(180deg,var(--bg-1),var(--bg-2))!important;
+  color:var(--text-1)!important;
 }
-
-/* Global Styles */
-body {
-  background-color: var(--background-color);
-  font-family: var(--font-family);
-  color: var(--text-color);
-  margin: 0;
-  padding: 0;
+a{color:var(--accent)!important;}
+div.stButton>button{
+  background-color:var(--primary-color);
+  color:#e8eef5;
+  border:none;
+  border-radius:.6rem;
+  padding:.6rem 1rem;
 }
-
-h1, h2, h3, h4, h5, h6 {
-  color: var(--text-color);
-  font-weight: 700;
-  margin-bottom: 0.5em;
-}
-
-/* Button Styles */
-div.stButton > button {
-  background-color: var(--primary-color);
-  color: #ffffff;
-  border: none;
-  padding: 0.75em 1.25em;
-  border-radius: var(--border-radius);
-  cursor: pointer;
-  transition: background-color 0.3s ease, transform 0.2s;
-}
-
-div.stButton > button:hover {
-  background-color: var(--primary-hover);
-  transform: translateY(-2px);
-}
-
-/* Card/Container Styling */
-.custom-container {
-  background: var(--card-background);
-  padding: 2em;
-  border-radius: var(--border-radius);
-  box-shadow: var(--card-shadow);
-  margin-bottom: 2em;
-}
-
-.css-1d391kg {
-  background: var(--card-background);
-  padding: 1em;
-  border-radius: var(--border-radius);
-  box-shadow: var(--card-shadow);
-}
-
-/* Form Element Styling */
-input, select, textarea {
-  border: 1px solid #ddd;
-  border-radius: 4px;
-  padding: 0.5em;
-  font-size: 1em;
-}
-
-input:focus, select:focus, textarea:focus {
-  outline: none;
-  border-color: var(--primary-color);
-  box-shadow: 0 0 5px rgba(0, 128, 128, 0.3);
-}
-
-/* Enforce font in uploader */
-.stFileUploader, .stFileUploader label, .stFileUploader div, .stFileUploader button, .stFileUploader *,
-[data-testid="stFileUploader"], [data-testid="stFileUploader"] *, [data-testid="stFileUploadDropzone"], [data-testid="stFileUploadDropzone"] *,
-input[type="file"] {
-  font-family: var(--font-family) !important;
-}
-
+div.stButton>button:hover{background-color:var(--primary-hover);}
+body{font-family:Avenir,sans-serif;line-height:1.65;}
 """
 st.markdown("<style>\n"+CSS+"\n</style>", unsafe_allow_html=True)
 
-st.title("UK to US Quote Converter with Optional PDF to DOCX Conversion")
-st.write("Please upload a docx using single-quotes dialogue for conversion to double-quotes dialogue, or upload a PDF of either type for conversion to double-quotes dialogue in a docx.")
+st.title("Quote Style Converter (pdf2docx – Global Clean v3)")
+st.caption("Layout-preserving PDF→DOCX with US quotes and deepest cleanup of page-join squares.")
 
-uploaded = st.file_uploader(
-    "Upload DOCX (single-quotes) or PDF",
-    type=["docx", "pdf"],
-    accept_multiple_files=False,
-    key="file",
-    label_visibility="collapsed"
-)
-
-
+with st.container():
+    mode = st.radio("Choose input type", ["DOCX → DOCX (UK → US)", "PDF → DOCX (pdf2docx → US quotes)"])
+    uploaded = st.file_uploader("Upload file", type=["docx","pdf"])
 
 if uploaded is not None:
-    # Show a simple file summary and a Convert button
-    st.write(f"Selected file: **{uploaded.name}**")
-    if st.button("Convert"):
-        name_lower = uploaded.name.lower()
-        if name_lower.endswith(".docx"):
-            if Document is None:
-                st.error("python-docx not available; cannot process DOCX.")
-            else:
-                try:
-                    raw = uploaded.read()
-                    out_bytes = docx_bytes_to_us_quotes(raw) if 'docx_bytes_to_us_quotes' in globals() else convert_docx_bytes_to_us(raw)
-                    st.success("Converted. Download below.")
-                    st.download_button("Download File", out_bytes,
-                        file_name=uploaded.name,
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-                except Exception as e:
-                    st.error(f"Conversion failed: {e}")
-        elif name_lower.endswith(".pdf"):
-            if PDF2DOCXConverter is None:
-                st.error("pdf2docx not available; cannot convert PDF to DOCX.")
-            else:
-                try:
-                    out_bytes = pdf_bytes_to_docx_using_pdf2docx(uploaded.read())
-                    st.success("Converted. Download below.")
-                    base = uploaded.name.rsplit(".",1)[0]
-                    st.download_button("Download File", out_bytes,
-                        file_name=base + ".docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-                except Exception as e:
-                    st.error(f"Conversion failed: {e}")
-        else:
-            st.error("Unsupported file type. Please upload a .docx or .pdf.")
+    if mode.startswith("DOCX"):
+        if not uploaded.name.lower().endswith(".docx"):
+            st.error("Please upload a .docx file for this mode.")
+        elif st.button("Convert DOCX to US quotes"):
+            try:
+                out_bytes = convert_docx_bytes_to_us(uploaded.read())
+                st.success("Converted. Download below.")
+                st.download_button("Download DOCX (US quotes)", out_bytes,
+                    file_name=uploaded.name.rsplit(".",1)[0]+" (US Quotes).docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            except Exception as e:
+                st.error(f"Conversion failed: {e}")
+    else:
+        if not uploaded.name.lower().endswith(".pdf"):
+            st.error("Please upload a .pdf file for this mode.")
+        elif st.button("Convert PDF → DOCX (pdf2docx → US quotes)"):
+            try:
+                out_bytes = pdf_bytes_to_docx_using_pdf2docx(uploaded.read())
+                st.success("Converted. Download below.")
+                st.download_button("Download DOCX (US quotes)", out_bytes,
+                    file_name=uploaded.name.rsplit(".",1)[0]+" (US Quotes).docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            except Exception as e:
+                st.error(f"Conversion failed: {e}")
 
-def fix_all_dropcaps(doc, max_passes=20):
-    """Deterministically fix up to max_passes drop-cap reorderings across the entire document."""
-    idx = 0
+
+# === ACBD drop-cap fixer (A=big letter+space, B=normal runs, C=from ALL-CAPS word to next paragraph that has <w:widowControl/>, D=that next paragraph) ===
+def _acbd_pt(val, default=None):
+    try:
+        return float(val.pt) if hasattr(val, "pt") else (float(val) if val is not None else default)
+    except Exception:
+        return default
+
+def _acbd_run_size_pt(run, para, default=11.0):
+    sz = _acbd_pt(getattr(run.font, "size", None))
+    if sz is not None:
+        return sz
+    try:
+        psz = _acbd_pt(para.style.font.size, None)
+        if psz is not None:
+            return psz
+    except Exception:
+        pass
+    return default
+
+def _acbd_run_text(run):
+    try:
+        return "".join(t.text or "" for t in run._element.xpath(".//w:t", namespaces=run._element.nsmap))
+    except Exception:
+        return getattr(run, "text", "") or ""
+
+def _acbd_first_word(s):
+    m = re.search(r"[A-Za-z]+", s or "")
+    return m.group(0) if m else ""
+
+def _acbd_is_all_caps_word(w):
+    return len(w) >= 2 and w.isalpha() and w.upper() == w
+
+def _acbd_para_has_widowcontrol(para):
+    try:
+        el = para._element
+        return bool(el.xpath(".//w:pPr/w:widowControl", namespaces=el.nsmap))
+    except Exception:
+        return False
+
+def _acbd_fix_once_in_paragraph(doc, p_index):
+    paras = doc.paragraphs
+    if p_index < 0 or p_index >= len(paras):
+        return False
+    p = paras[p_index]
+    runs = list(p.runs)
+    if not runs:
+        return False
+
+    sizes = [_acbd_run_size_pt(r, p) for r in runs]
+    vals = [v for v in sizes if v is not None]
+    if not vals:
+        return False
+    try:
+        import statistics as _stats
+        majority = float(_stats.median(vals))
+    except Exception:
+        majority = sum(vals)/len(vals)
+    threshold = 1.5 * majority
+
+    # A
+    A_idx = None
+    A_char = None
+    for i, r in enumerate(runs):
+        txt = _acbd_run_text(r)
+        alpha = [ch for ch in txt if ch.isalpha()]
+        if len(alpha) == 1 and sizes[i] is not None and sizes[i] >= threshold:
+            A_idx = i
+            A_char = alpha[0]
+            break
+    if A_idx is None:
+        return False
+
+    # C-start: first run after A whose FIRST WORD is ALL-CAPS
+    C_start = None
+    for j in range(A_idx+1, len(runs)):
+        fw = _acbd_first_word(_acbd_run_text(runs[j]))
+        if _acbd_is_all_caps_word(fw):
+            C_start = j
+            break
+    if C_start is None:
+        return False
+
+    # D begins at next paragraph which must have widowControl (and exists)
+    if p_index + 1 >= len(paras):
+        return False
+    if not _acbd_para_has_widowcontrol(paras[p_index+1]):
+        return False
+
+    # B text: runs between A+1 and C_start
+    B_text = "".join(_acbd_run_text(runs[t]) for t in range(A_idx+1, C_start)).strip()
+    # C text: runs from C_start to end of paragraph p_index
+    C_text = "".join(_acbd_run_text(runs[t]) for t in range(C_start, len(runs))).strip()
+    if not B_text or not C_text:
+        return False
+
+    new_text = (A_char.upper() + C_text).strip()
+    if B_text:
+        new_text += " " + B_text
+
+    if new_text and new_text != (p.text or "").strip():
+        p.text = new_text
+        return True
+    return False
+
+def fix_dropcaps_acbd(doc, max_passes=50):
     passes = 0
     while passes < max_passes:
-        changed, idx = _fix_one_dropcap_occurrence(doc, start_idx=idx)
-        if not changed:
-            # Restart from the top once to catch any pattern that may appear earlier
-            if idx != 0:
-                idx = 0
-                passes += 1
-                continue
+        changes = 0
+        for i in range(len(doc.paragraphs)):
+            if _acbd_fix_once_in_paragraph(doc, i):
+                changes += 1
+        if changes == 0:
             break
         passes += 1
     return doc
+# === end ACBD fixer ===
 
