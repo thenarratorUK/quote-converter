@@ -23,6 +23,16 @@ def _acbd_log(msg: str):
 import statistics as _acbd_stats
 import re as _acbd_re
 
+def _acbd_is_letter_space(txt: str) -> bool:
+    """Return True if txt is exactly: one uppercase A–Z followed by exactly one space (regular or NBSP)."""
+    if txt is None:
+        return False
+    # Preserve spaces; remove control chars
+    t = txt.replace("\u00A0", "\u0020")  # NBSP -> space
+    # Accept exactly two chars: [A-Z][space]
+    return bool(_acbd_re.fullmatch(r"[A-Z] ", t))
+
+
 def _acbd_pt(val, default=None):
     try:
         return float(val.pt) if hasattr(val, "pt") else (float(val) if val is not None else default)
@@ -30,21 +40,26 @@ def _acbd_pt(val, default=None):
         return default
 
 def _acbd_run_size_pt(run, para, default=11.0):
-    # Prefer python-docx size if present; else pull from XML (<w:sz w:val=".."> half-points)
+    # Prefer python-docx size if present; else pull from XML (<w:sz> or <w:szCs>), else paragraph style
     sz = _acbd_pt(getattr(run.font, "size", None))
     if sz is not None:
         return sz
     try:
-        # Fallback to run XML
         el = run._element
-        vals = el.xpath(".//w:rPr/w:sz/@w:val", namespaces=el.nsmap)
+        vals = el.xpath(".//w:rPr/w:sz/@w:val | .//w:rPr/w:szCs/@w:val", namespaces=el.nsmap)
         if vals:
             try:
-                # .docx stores half-points in w:val; convert to points
-                return float(vals[0]) / 2.0
+                return float(vals[0]) / 2.0  # half-points -> points
             except Exception:
                 pass
-        # Fallback to paragraph style
+        # Also check paragraph-level rPr if present
+        pel = para._element
+        pvals = pel.xpath(".//w:pPr/w:rPr/w:sz/@w:val | .//w:pPr/w:rPr/w:szCs/@w:val", namespaces=pel.nsmap)
+        if pvals:
+            try:
+                return float(pvals[0]) / 2.0
+            except Exception:
+                pass
         psz = _acbd_pt(para.style.font.size, None)
         if psz is not None:
             return psz
@@ -124,25 +139,79 @@ def _acbd_fix_once_in_paragraph(doc, p_index):
     if not runs:
         return False
 
-    majority = _acbd_para_median_size(p)
-    threshold = 1.5 * majority
-
-    # A: first run with exactly one alphabetic glyph and size >= threshold
-    A_idx = None
-    A_char = None
+    # Collect sizes and texts
+    run_info = []
     for i, r in enumerate(runs):
         txt = _acbd_run_text(r)
-        alpha = [ch for ch in txt if ch.isalpha()]
-        sz = _acbd_run_size_pt(r, p, default=majority)
-        if len(alpha) == 1 and sz is not None and sz >= threshold:
+        sz = _acbd_run_size_pt(r, p)
+        run_info.append((i, sz, txt))
+    sizes = [s for _, s, _ in run_info if s is not None]
+    majority = (float(_acbd_stats.median(sizes)) if sizes else 11.0)
+    threshold = 1.5 * majority
+    max_size = max(sizes) if sizes else majority
+    if ACBD_DIAG:
+        _acbd_log(f"[ACBD] p={p_index}: sizes(med={majority:.1f}, thr={threshold:.1f}, max={max_size:.1f}) top3=" +
+                  str(sorted(sizes, reverse=True)[:3]))
+
+
+    # Primary A detection (strict): text must be exactly "single uppercase letter + one space"
+    A_idx = None
+    A_char = None
+    for i, sz, txt in run_info:
+        if not txt:
+            continue
+        if _acbd_is_letter_space(txt) and sz is not None and sz >= threshold:
             A_idx = i
-            A_char = alpha[0]
+            A_char = txt[0]  # the uppercase letter
             break
+
+    # Fallback A detection (relaxed): choose largest run that matches the pattern; or, as last resort,
+    # a run that starts with an uppercase letter and is at most 3 visible chars (after stripping NBSP),
+    # provided its size is clearly above normal.
     if A_idx is None:
-        _acbd_log(f"[ACBD] p={p_index}: no A (threshold={threshold:.1f}, median={majority:.1f})")
+        # Strict candidates: exactly "Letter+space"
+        strict_candidates = [(i, sz, txt) for i, sz, txt in run_info if txt and _acbd_is_letter_space(txt)]
+        if strict_candidates:
+            i_best, sz_best, txt_best = max(strict_candidates, key=lambda t: (t[1] or 0))
+            if (sz_best is not None and ((sz_best >= (majority + 6.0)) or (sz_best >= 1.3 * majority) or (abs(sz_best - max_size) < 0.1))):
+                A_idx = i_best
+                A_char = txt_best[0]
+        if A_idx is None:
+            # Very last resort: uppercase-leading short run (<=3 non-space chars)
+            alt = []
+            for i, sz, txt in run_info:
+                if not txt:
+                    continue
+                t = txt.replace("\u00A0", " ")
+                t_stripped = t.strip()
+                # Count visible non-space characters
+                vis = "".join(ch for ch in t_stripped if not ch.isspace())
+                if vis and vis[0].isalpha() and vis[0].upper() == vis[0] and len(vis) <= 3:
+                    alt.append((i, sz, txt))
+            if alt:
+                i_best, sz_best, txt_best = max(alt, key=lambda t: (t[1] or 0))
+                if (sz_best is not None and ((sz_best >= (majority + 6.0)) or (sz_best >= 1.3 * majority) or (abs(sz_best - max_size) < 0.1))):
+                    A_idx = i_best
+                    # Choose first alphabetic as A_char
+                    for ch in txt_best:
+                        if ch.isalpha():
+                            A_char = ch
+                            break
+    # Fallback A detection
+    if A_idx is None:
+        candidates = [(i, sz, txt) for i, sz, txt in run_info if txt and sum(ch.isalpha() for ch in txt) == 1]
+        if candidates:
+            i_best, sz_best, txt_best = max(candidates, key=lambda t: (t[1] or 0))
+            if (sz_best is not None and ((sz_best >= (majority + 6.0)) or (sz_best >= 1.3 * majority) or (abs(sz_best - max_size) < 0.1))):
+                A_idx = i_best
+                A_char = next(ch for ch in txt_best if ch.isalpha())
+
+    if A_idx is None or not A_char:
+        _acbd_log(f"[ACBD] p={p_index}: no A (thr={threshold:.1f}, med={majority:.1f}, max={max_size:.1f}) "
+                  f"| singles={[ (i, s, t) for i,s,t in run_info if t and sum(ch.isalpha() for ch in t)==1 ][:3]}")
         return False
 
-    # Find C-start across runs/paragraphs; stop only if widowControl encountered before any ALL-CAPS
+    # C-start and widowControl search
     c_start_loc = _acbd_first_caps_token_across_runs(doc, p_index, A_idx+1)
     wc_idx = _acbd_find_widowcontrol_forward(doc, p_index+1)
     if wc_idx is not None and (c_start_loc is None or c_start_loc[0] >= wc_idx):
@@ -151,13 +220,11 @@ def _acbd_fix_once_in_paragraph(doc, p_index):
     if c_start_loc is None:
         _acbd_log(f"[ACBD] p={p_index}: no C-start found in document tail; skip")
         return False
-
-    c_pi, c_ri, c_ci = c_start_loc
-
-    # Ensure we have a widowControl paragraph to terminate C
     if wc_idx is None:
         _acbd_log(f"[ACBD] p={p_index}: no widowControl found after; skip")
         return False
+
+    c_pi, c_ri, c_ci = c_start_loc
 
     # Build B
     if c_pi == p_index:
@@ -165,7 +232,7 @@ def _acbd_fix_once_in_paragraph(doc, p_index):
     else:
         B_text = "".join(_acbd_run_text(runs[t]) for t in range(A_idx+1, len(runs))).strip()
 
-    # Build C: from c_start_loc to end of c_pi paragraph, plus any full paragraphs until wc_idx (exclusive)
+    # Build C
     C_parts = []
     c_runs = paras[c_pi].runs
     start_txt = _acbd_run_text(c_runs[c_ri])
@@ -180,7 +247,6 @@ def _acbd_fix_once_in_paragraph(doc, p_index):
         _acbd_log(f"[ACBD] p={p_index}: empty B or C (B={len(B_text)}, C={len(C_text)}); skip")
         return False
 
-    # Recompose current paragraph only: A + C + " " + B
     new_text = (A_char.upper() + C_text).strip()
     if B_text:
         new_text += " " + B_text
@@ -207,6 +273,7 @@ def fix_dropcaps_acbd(doc, max_passes=80):
             break
         passes += 1
     return doc
+
 
 def acbd_write_log(sidecar_path=None):
     """
