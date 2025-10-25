@@ -9,8 +9,10 @@ import io, os, re, tempfile, streamlit as st
 #   that contains <w:widowControl/> is encountered (exclusive).
 # • D = the widowControl paragraph (left untouched).
 # • Reorder: current paragraph text becomes A + C + " " + B. Repeat until stable.
-# Diagnostics: set ACBD_DIAG = True for per-paragraph prints.
+# Diagnostics: set ACBD_DIAG = True
+ACBD_GLOBAL_MEDIAN_SIZE = None for per-paragraph prints.
 ACBD_DIAG = True
+ACBD_GLOBAL_MEDIAN_SIZE = None
 ACBD_LOG = []
 
 def _acbd_log(msg: str):
@@ -120,6 +122,27 @@ def _acbd_find_widowcontrol_forward(doc, start_para):
             return pi
     return None
 
+
+
+def _acbd_doc_global_median_size(doc, default=12.0):
+    """Compute a global median font size (points) over ALL runs in the document using w:sz/w:szCs/xml fallbacks."""
+    sizes = []
+    for p in doc.paragraphs:
+        for r in p.runs:
+            try:
+                # Reuse existing sizing function if present
+                sz = _acbd_run_size_pt(r, p, default=None)
+            except Exception:
+                sz = None
+            if sz is not None:
+                sizes.append(sz)
+    if not sizes:
+        return default
+    try:
+        import statistics as _stats
+        return float(_stats.median(sizes))
+    except Exception:
+        return sum(sizes)/len(sizes)
 def _acbd_para_median_size(para):
     sizes = [_acbd_run_size_pt(r, para) for r in para.runs]
     sizes = [s for s in sizes if s is not None]
@@ -146,25 +169,43 @@ def _acbd_fix_once_in_paragraph(doc, p_index):
         sz = _acbd_run_size_pt(r, p)
         run_info.append((i, sz, txt))
     sizes = [s for _, s, _ in run_info if s is not None]
-    majority = (float(_acbd_stats.median(sizes)) if sizes else 11.0)
+        majority = (ACBD_GLOBAL_MEDIAN_SIZE if ACBD_GLOBAL_MEDIAN_SIZE is not None else 12.0)
     threshold = 1.5 * majority
-    max_size = max(sizes) if sizes else majority
+
+        max_size = max((s for _, s, _ in run_info if s is not None), default=majority)
     if ACBD_DIAG:
-        _acbd_log(f"[ACBD] p={p_index}: sizes(med={majority:.1f}, thr={threshold:.1f}, max={max_size:.1f}) top3=" +
-                  str(sorted(sizes, reverse=True)[:3]))
+        _acbd_log(f"[ACBD] p={p_index}: sizes(med={majority:.1f}, thr={threshold:.1f}, max={max_size:.1f}) top3=" + str(sorted(sizes, reverse=True)[:3]))
+        # Show top runs by size with a short repr of their text
+        top_runs = sorted(run_info, key=lambda t: (t[1] or -1), reverse=True)[:5]
+        for (ri, rsz, rtxt) in top_runs:
+            _acbd_log(f"    [run {ri}] sz={rsz} text={repr((rtxt or )[:30])}")
 
 
-    # Primary A detection (strict): text must be exactly "single uppercase letter + one space"
+
+    # Primary A detection (semi-strict):
+    # Accept a run that contains exactly one uppercase alphabetic char and no other letters,
+    # size >= threshold, and either:
+    #   (a) the run text ends with a space (including NBSP), or
+    #   (b) the immediate next run exists and is purely whitespace.
     A_idx = None
     A_char = None
     for i, sz, txt in run_info:
         if not txt:
             continue
-        if _acbd_is_letter_space(txt) and sz is not None and sz >= threshold:
-            A_idx = i
-            A_char = txt[0]  # the uppercase letter
-            break
-
+        # Count alphabetic letters in this run
+        letters = [ch for ch in txt if ch.isalpha()]
+        if len(letters) == 1 and letters[0].isupper() and sz is not None and sz >= threshold:
+            ends_space = (txt.endswith(" ") or txt.endswith("\u00A0"))
+            next_is_space = False
+            # Check immediate next run for pure whitespace
+            if i + 1 < len(run_info):
+                nxt_txt = run_info[i+1][2] or ""
+                nxt_txt_norm = nxt_txt.replace("\u00A0", " ")
+                next_is_space = (nxt_txt_norm.strip() == "")
+            if ends_space or next_is_space:
+                A_idx = i
+                A_char = letters[0]
+                if ACBD_DIAG:\n                    _acbd_log(f"[ACBD] p={p_index}: A candidate at run {i} (sz={sz}) ends_space={ends_space} next_space={next_is_space}")\n                break
     # Fallback A detection (relaxed): choose largest run that matches the pattern; or, as last resort,
     # a run that starts with an uppercase letter and is at most 3 visible chars (after stripping NBSP),
     # provided its size is clearly above normal.
@@ -221,8 +262,8 @@ def _acbd_fix_once_in_paragraph(doc, p_index):
         _acbd_log(f"[ACBD] p={p_index}: no C-start found in document tail; skip")
         return False
     if wc_idx is None:
-        _acbd_log(f"[ACBD] p={p_index}: no widowControl found after; skip")
-        return False
+        _acbd_log(f"[ACBD] p={p_index}: no widowControl found; FALLBACK to C within current paragraph")
+        wc_idx = c_pi  # treat end of C as end of C-start paragraph
 
     c_pi, c_ri, c_ci = c_start_loc
 
@@ -260,6 +301,8 @@ def _acbd_fix_once_in_paragraph(doc, p_index):
         return False
 
 def fix_dropcaps_acbd(doc, max_passes=80):
+    global ACBD_GLOBAL_MEDIAN_SIZE
+    ACBD_GLOBAL_MEDIAN_SIZE = _acbd_doc_global_median_size(doc)
     passes = 0
     while passes < max_passes:
         changes = 0
@@ -268,7 +311,7 @@ def fix_dropcaps_acbd(doc, max_passes=80):
             while inner < 6 and _acbd_fix_once_in_paragraph(doc, i):
                 changes += 1
                 inner += 1
-        _acbd_log(f"[ACBD] pass={passes} changes={changes}")
+        _acbd_log(f"[ACBD] pass={passes} changes={changes} global_med={ACBD_GLOBAL_MEDIAN_SIZE}")
         if changes == 0:
             break
         passes += 1
