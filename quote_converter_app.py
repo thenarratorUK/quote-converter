@@ -10,7 +10,7 @@ import io, os, re, tempfile, streamlit as st
 # • D = the widowControl paragraph (left untouched).
 # • Reorder: current paragraph text becomes A + C + " " + B. Repeat until stable.
 # Diagnostics: set ACBD_DIAG = True
-ACBD_GLOBAL_MEDIAN_SIZE = None for per-paragraph prints.
+ACBD_GLOBAL_MEDIAN_SIZE = None  # for per-paragraph prints.
 ACBD_DIAG = True
 ACBD_GLOBAL_MEDIAN_SIZE = None
 ACBD_LOG = []
