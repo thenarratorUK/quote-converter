@@ -162,121 +162,82 @@ def _acbd_fix_once_in_paragraph(doc, p_index):
     if not runs:
         return False
 
-    # Collect sizes and texts
+    # Gather run info (size, text) for this paragraph
     run_info = []
     for i, r in enumerate(runs):
         txt = _acbd_run_text(r)
         sz = _acbd_run_size_pt(r, p)
         run_info.append((i, sz, txt))
-    sizes = [s for _, s, _ in run_info if s is not None]
+
+    # Use GLOBAL median as requested
     majority = (ACBD_GLOBAL_MEDIAN_SIZE if ACBD_GLOBAL_MEDIAN_SIZE is not None else 12.0)
     threshold = 1.5 * majority
-
     max_size = max((s for _, s, _ in run_info if s is not None), default=majority)
+
     if ACBD_DIAG:
-        _acbd_log(f"[ACBD] p={p_index}: sizes(med={majority:.1f}, thr={threshold:.1f}, max={max_size:.1f}) top3=" + str(sorted(sizes, reverse=True)[:3]))
-        # Show top runs by size with a short repr of their text
+        _acbd_log(f"[ACBD] p={p_index}: sizes(med={majority:.1f}, thr={threshold:.1f}, max={max_size:.1f})")
+        # Show top runs by size
         top_runs = sorted(run_info, key=lambda t: (t[1] or -1), reverse=True)[:5]
         for (ri, rsz, rtxt) in top_runs:
-            _acbd_log(f"    [run {ri}] sz={rsz} text={repr((rtxt or )[:30])}")
+            preview = (rtxt or '')[:30]
+            _acbd_log(f"    [run {ri}] sz={rsz} text={repr(preview)}")
 
-
-
-    # Primary A detection (semi-strict):
-    # Accept a run that contains exactly one uppercase alphabetic char and no other letters,
-    # size >= threshold, and either:
-    #   (a) the run text ends with a space (including NBSP), or
-    #   (b) the immediate next run exists and is purely whitespace.
+    # Primary A detection: single uppercase letter + a space (or NBSP) in this run,
+    # size >= threshold; OR the next run is pure whitespace
     A_idx = None
     A_char = None
     for i, sz, txt in run_info:
         if not txt:
             continue
-        # Count alphabetic letters in this run
         letters = [ch for ch in txt if ch.isalpha()]
         if len(letters) == 1 and letters[0].isupper() and sz is not None and sz >= threshold:
-            ends_space = (txt.endswith(" ") or txt.endswith("\u00A0"))
+            ends_space = txt.endswith(" ") or txt.endswith("\u00A0")
             next_is_space = False
-            # Check immediate next run for pure whitespace
             if i + 1 < len(run_info):
                 nxt_txt = run_info[i+1][2] or ""
-                nxt_txt_norm = nxt_txt.replace("\u00A0", " ")
-                next_is_space = (nxt_txt_norm.strip() == "")
+                nxt_norm = nxt_txt.replace("\u00A0", " ")
+                next_is_space = (nxt_norm.strip() == "")
             if ends_space or next_is_space:
                 A_idx = i
                 A_char = letters[0]
-                if ACBD_DIAG:\n                    _acbd_log(f"[ACBD] p={p_index}: A candidate at run {i} (sz={sz}) ends_space={ends_space} next_space={next_is_space}")\n                break
-    # Fallback A detection (relaxed): choose largest run that matches the pattern; or, as last resort,
-    # a run that starts with an uppercase letter and is at most 3 visible chars (after stripping NBSP),
-    # provided its size is clearly above normal.
-    if A_idx is None:
-        # Strict candidates: exactly "Letter+space"
-        strict_candidates = [(i, sz, txt) for i, sz, txt in run_info if txt and _acbd_is_letter_space(txt)]
-        if strict_candidates:
-            i_best, sz_best, txt_best = max(strict_candidates, key=lambda t: (t[1] or 0))
-            if (sz_best is not None and ((sz_best >= (majority + 6.0)) or (sz_best >= 1.3 * majority) or (abs(sz_best - max_size) < 0.1))):
-                A_idx = i_best
-                A_char = txt_best[0]
-        if A_idx is None:
-            # Very last resort: uppercase-leading short run (<=3 non-space chars)
-            alt = []
-            for i, sz, txt in run_info:
-                if not txt:
-                    continue
-                t = txt.replace("\u00A0", " ")
-                t_stripped = t.strip()
-                # Count visible non-space characters
-                vis = "".join(ch for ch in t_stripped if not ch.isspace())
-                if vis and vis[0].isalpha() and vis[0].upper() == vis[0] and len(vis) <= 3:
-                    alt.append((i, sz, txt))
-            if alt:
-                i_best, sz_best, txt_best = max(alt, key=lambda t: (t[1] or 0))
-                if (sz_best is not None and ((sz_best >= (majority + 6.0)) or (sz_best >= 1.3 * majority) or (abs(sz_best - max_size) < 0.1))):
-                    A_idx = i_best
-                    # Choose first alphabetic as A_char
-                    for ch in txt_best:
-                        if ch.isalpha():
-                            A_char = ch
-                            break
-    # Fallback A detection
-    if A_idx is None:
-        candidates = [(i, sz, txt) for i, sz, txt in run_info if txt and sum(ch.isalpha() for ch in txt) == 1]
-        if candidates:
-            i_best, sz_best, txt_best = max(candidates, key=lambda t: (t[1] or 0))
-            if (sz_best is not None and ((sz_best >= (majority + 6.0)) or (sz_best >= 1.3 * majority) or (abs(sz_best - max_size) < 0.1))):
-                A_idx = i_best
-                A_char = next(ch for ch in txt_best if ch.isalpha())
+                if ACBD_DIAG:
+                    _acbd_log(f"[ACBD] p={p_index}: A at run {i} (sz={sz}) ends_space={ends_space} next_space={next_is_space}")
+                break
 
-    if A_idx is None or not A_char:
-        _acbd_log(f"[ACBD] p={p_index}: no A (thr={threshold:.1f}, med={majority:.1f}, max={max_size:.1f}) "
-                  f"| singles={[ (i, s, t) for i,s,t in run_info if t and sum(ch.isalpha() for ch in t)==1 ][:3]}")
+    if A_idx is None:
+        # No suitable A in this paragraph
+        _acbd_log(f"[ACBD] p={p_index}: no A (thr={threshold:.1f}, med={majority:.1f}, max={max_size:.1f})")
         return False
 
-    # C-start and widowControl search
+    # Find C-start across runs/paragraphs; stop only if widowControl encountered before any ALL-CAPS
     c_start_loc = _acbd_first_caps_token_across_runs(doc, p_index, A_idx+1)
     wc_idx = _acbd_find_widowcontrol_forward(doc, p_index+1)
+
     if wc_idx is not None and (c_start_loc is None or c_start_loc[0] >= wc_idx):
         _acbd_log(f"[ACBD] p={p_index}: widowControl@{wc_idx} before C-start; skip")
         return False
     if c_start_loc is None:
         _acbd_log(f"[ACBD] p={p_index}: no C-start found in document tail; skip")
         return False
-    if wc_idx is None:
-        _acbd_log(f"[ACBD] p={p_index}: no widowControl found; FALLBACK to C within current paragraph")
-        wc_idx = c_pi  # treat end of C as end of C-start paragraph
 
     c_pi, c_ri, c_ci = c_start_loc
 
-    # Build B
+    # If no widowControl is found later, fall back to using the C-start paragraph as terminator
+    if wc_idx is None:
+        _acbd_log(f"[ACBD] p={p_index}: no widowControl found; FALLBACK to C within C-start paragraph")
+        wc_idx = c_pi
+
+    # Build B (text between A and C-start within this paragraph if C-start here, else all remaining runs)
     if c_pi == p_index:
         B_text = "".join(_acbd_run_text(runs[t]) for t in range(A_idx+1, c_ri)).strip()
     else:
         B_text = "".join(_acbd_run_text(runs[t]) for t in range(A_idx+1, len(runs))).strip()
 
-    # Build C
+    # Build C text from c_start to the paragraph just before widowControl
     C_parts = []
     c_runs = paras[c_pi].runs
     start_txt = _acbd_run_text(c_runs[c_ri])
+    # Include from c_ci (char offset) onward in the starting run
     C_parts.append(start_txt[c_ci:] if c_ci < len(start_txt) else "")
     for t in range(c_ri+1, len(c_runs)):
         C_parts.append(_acbd_run_text(c_runs[t]))
@@ -288,6 +249,7 @@ def _acbd_fix_once_in_paragraph(doc, p_index):
         _acbd_log(f"[ACBD] p={p_index}: empty B or C (B={len(B_text)}, C={len(C_text)}); skip")
         return False
 
+    # Recompose current paragraph: A + C + " " + B
     new_text = (A_char.upper() + C_text).strip()
     if B_text:
         new_text += " " + B_text
