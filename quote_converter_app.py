@@ -169,10 +169,10 @@ def _acbd_fix_once_in_paragraph(doc, p_index):
         sz = _acbd_run_size_pt(r, p)
         run_info.append((i, sz, txt))
     sizes = [s for _, s, _ in run_info if s is not None]
-        majority = (ACBD_GLOBAL_MEDIAN_SIZE if ACBD_GLOBAL_MEDIAN_SIZE is not None else 12.0)
+    majority = (ACBD_GLOBAL_MEDIAN_SIZE if ACBD_GLOBAL_MEDIAN_SIZE is not None else 12.0)
     threshold = 1.5 * majority
 
-        max_size = max((s for _, s, _ in run_info if s is not None), default=majority)
+    max_size = max((s for _, s, _ in run_info if s is not None), default=majority)
     if ACBD_DIAG:
         _acbd_log(f"[ACBD] p={p_index}: sizes(med={majority:.1f}, thr={threshold:.1f}, max={max_size:.1f}) top3=" + str(sorted(sizes, reverse=True)[:3]))
         # Show top runs by size with a short repr of their text
