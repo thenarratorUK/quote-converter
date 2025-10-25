@@ -10,8 +10,26 @@ import io, os, re, tempfile, streamlit as st
 #         that contains <w:widowControl/> is encountered (exclusive).
 #  • D = the widowControl paragraph (left untouched).
 #  • Reorder: current paragraph text becomes A + C + " " + B. Repeat until stable.
-# Diagnostics: set ACBD_DIAG = True for per-paragraph prints.
-ACBD_DIAG = False
+# Diagnostics: set ACBD_DIAG = True
+ACBD_LOG = []
+
+def _acbd_log(msg):
+    ACBD_LOG.append(str(msg))
+    try:
+        print(str(msg))
+    except Exception:
+        pass
+ for per-paragraph prints.
+ACBD_DIAG = True
+ACBD_LOG = []
+
+def _acbd_log(msg):
+    ACBD_LOG.append(str(msg))
+    try:
+        print(str(msg))
+    except Exception:
+        pass
+
 
 import statistics as _acbd_stats
 import re as _acbd_re
@@ -136,7 +154,7 @@ def _acbd_fix_once_in_paragraph(doc, p_index):
             A_char = alpha[0]
             break
     if A_idx is None:
-        if ACBD_DIAG: print(f"[ACBD] p={p_index}: no A (threshold={threshold:.1f}, median={majority:.1f})")
+        if ACBD_DIAG: _acbd_log(f"[ACBD] p={p_index}: no A (threshold={threshold:.1f}, median={majority:.1f})")
         return False
 
     # Find C-start across runs/paragraphs; stop only if widowControl encountered before any ALL-CAPS
@@ -144,17 +162,17 @@ def _acbd_fix_once_in_paragraph(doc, p_index):
     wc_idx = _acbd_find_widowcontrol_forward(doc, p_index+1)
     if wc_idx is not None and (c_start_loc is None or c_start_loc[0] >= wc_idx):
         # widowControl reached before any ALL-CAPS start
-        if ACBD_DIAG: print(f"[ACBD] p={p_index}: widowControl@{wc_idx} before C-start; skip")
+        if ACBD_DIAG: _acbd_log(f"[ACBD] p={p_index}: widowControl@{wc_idx} before C-start; skip")
         return False
     if c_start_loc is None:
-        if ACBD_DIAG: print(f"[ACBD] p={p_index}: no C-start found in document tail; skip")
+        if ACBD_DIAG: _acbd_log(f"[ACBD] p={p_index}: no C-start found in document tail; skip")
         return False
 
     c_pi, c_ri, c_ci = c_start_loc
 
     # Ensure we have a widowControl paragraph to terminate C
     if wc_idx is None:
-        if ACBD_DIAG: print(f"[ACBD] p={p_index}: no widowControl found after; skip")
+        if ACBD_DIAG: _acbd_log(f"[ACBD] p={p_index}: no widowControl found after; skip")
         return False
 
     # Build B
@@ -177,7 +195,7 @@ def _acbd_fix_once_in_paragraph(doc, p_index):
     C_text = "".join(C_parts).strip()
 
     if not B_text or not C_text:
-        if ACBD_DIAG: print(f"[ACBD] p={p_index}: empty B or C (B={len(B_text)}, C={len(C_text)}); skip")
+        if ACBD_DIAG: _acbd_log(f"[ACBD] p={p_index}: empty B or C (B={len(B_text)}, C={len(C_text)}); skip")
         return False
 
     # Recompose current paragraph only: A + C + " " + B
@@ -187,11 +205,11 @@ def _acbd_fix_once_in_paragraph(doc, p_index):
 
     if new_text != (p.text or "").strip():
         if ACBD_DIAG:
-            print(f"[ACBD] p={p_index}: REORDERED | A='{A_char}' | B[:30]='{B_text[:30]}' | C[:30]='{C_text[:30]}' | wc@{wc_idx} c@({c_pi},{c_ri},{c_ci})")
+            _acbd_log(f"[ACBD] p={p_index}: REORDERED | A='{A_char}' | B[:30]='{B_text[:30]}' | C[:30]='{C_text[:30]}' | wc@{wc_idx} c@({c_pi},{c_ri},{c_ci})")
         p.text = new_text
         return True
     else:
-        if ACBD_DIAG: print(f"[ACBD] p={p_index}: no change after recomposition")
+        if ACBD_DIAG: _acbd_log(f"[ACBD] p={p_index}: no change after recomposition")
         return False
 
 def fix_dropcaps_acbd(doc, max_passes=80):
@@ -204,7 +222,7 @@ def fix_dropcaps_acbd(doc, max_passes=80):
             while inner < 6 and _acbd_fix_once_in_paragraph(doc, i):
                 changes += 1
                 inner += 1
-        if ACBD_DIAG: print(f"[ACBD] pass={passes} changes={changes}")
+        if ACBD_DIAG: _acbd_log(f"[ACBD] pass={passes} changes={changes}")
         if changes == 0:
             break
         passes += 1
@@ -370,6 +388,7 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
         cv.close()
         doc = Document(out_path)
         fix_dropcaps_acbd(doc)
+        acbd_write_log()
 
         # 1) Deep removal across all parts (fix persistent squares)
         _remove_global_shapes_all_parts(doc)
@@ -524,3 +543,20 @@ if uploaded is not None:
                     st.error(f"Conversion failed: {e}")
         else:
             st.error("Unsupported file type. Please upload a .docx or .pdf.")
+
+def acbd_write_log(sidecar_path=None):
+    """
+    Write ACBD diagnostics to a sidecar text file.
+    If sidecar_path is None, default to '/mnt/data/ACBD_diagnostics.txt'.
+    """
+    path = sidecar_path or "/mnt/data/ACBD_diagnostics.txt"
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            for line in ACBD_LOG:
+                f.write(line.rstrip("\n") + "\n")
+    except Exception as e:
+        try:
+            print(f"[ACBD] failed to write log: {e}")
+        except Exception:
+            pass
+
