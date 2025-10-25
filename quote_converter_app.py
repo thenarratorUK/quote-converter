@@ -1,4 +1,3 @@
-# quote_converter_app_pdf2docx_final_globclean_v3.py
 import io, os, re, tempfile, streamlit as st
 
 try:
@@ -140,7 +139,6 @@ def convert_docx_bytes_to_us(docx_bytes: bytes) -> bytes:
     if Document is None:
         raise RuntimeError("python-docx required.")
     doc = Document(io.BytesIO(docx_bytes))
-    fix_dropcaps_acbd(doc)
     convert_docx_runs_to_us(doc)
     out = io.BytesIO(); doc.save(out)
     return out.getvalue()
@@ -184,61 +182,144 @@ def pdf_bytes_to_docx_using_pdf2docx(pdf_bytes: bytes) -> bytes:
 
 st.set_page_config(page_title="Quote Style Converter (Global Clean v3)", page_icon="📝", layout="centered")
 
-CSS = """
-:root { --primary-color:#008080;--primary-hover:#006666;--bg-1:#0b0f14;--bg-2:#11161d;
---card:#0f141a;--text-1:#e8eef5;--text-2:#b2c0cf;--muted:#8aa0b5;--accent:#e0f2f1;--ring:rgba(0,128,128,0.5);}
-html,body,[data-testid="stAppViewContainer"]{
-  background:linear-gradient(180deg,var(--bg-1),var(--bg-2))!important;
-  color:var(--text-1)!important;
+CSS = """:root {
+  --primary-color: #008080;      /* Teal */
+  --primary-hover: #007070;
+  --background-color: #fdfdfd;
+  --text-color: #222222;
+  --card-background: #ffffff;
+  --card-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
+  --border-radius: 10px;
+  --font-family: 'Avenir', sans-serif;
+  --accent-color: #ff9900;
 }
-a{color:var(--accent)!important;}
-div.stButton>button{
-  background-color:var(--primary-color);
-  color:#e8eef5;
-  border:none;
-  border-radius:.6rem;
-  padding:.6rem 1rem;
+
+/* Global Styles */
+body {
+  background-color: var(--background-color);
+  font-family: var(--font-family);
+  color: var(--text-color);
+  margin: 0;
+  padding: 0;
 }
-div.stButton>button:hover{background-color:var(--primary-hover);}
-body{font-family:Avenir,sans-serif;line-height:1.65;}
+
+h1, h2, h3, h4, h5, h6 {
+  color: var(--text-color);
+  font-weight: 700;
+  margin-bottom: 0.5em;
+}
+
+/* Button Styles */
+div.stButton > button {
+  background-color: var(--primary-color);
+  color: #ffffff;
+  border: none;
+  padding: 0.75em 1.25em;
+  border-radius: var(--border-radius);
+  cursor: pointer;
+  transition: background-color 0.3s ease, transform 0.2s;
+}
+
+div.stButton > button:hover {
+  background-color: var(--primary-hover);
+  transform: translateY(-2px);
+}
+
+/* Card/Container Styling */
+.custom-container {
+  background: var(--card-background);
+  padding: 2em;
+  border-radius: var(--border-radius);
+  box-shadow: var(--card-shadow);
+  margin-bottom: 2em;
+}
+
+.css-1d391kg {
+  background: var(--card-background);
+  padding: 1em;
+  border-radius: var(--border-radius);
+  box-shadow: var(--card-shadow);
+}
+
+/* Form Element Styling */
+input, select, textarea {
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  padding: 0.5em;
+  font-size: 1em;
+}
+
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: var(--primary-color);
+  box-shadow: 0 0 5px rgba(0, 128, 128, 0.3);
+}
+
+/* Enforce font in uploader */
+.stFileUploader, .stFileUploader label, .stFileUploader div, .stFileUploader button, .stFileUploader *,
+[data-testid="stFileUploader"], [data-testid="stFileUploader"] *, [data-testid="stFileUploadDropzone"], [data-testid="stFileUploadDropzone"] *,
+input[type="file"] {
+  font-family: var(--font-family) !important;
+}
+
 """
 st.markdown("<style>\n"+CSS+"\n</style>", unsafe_allow_html=True)
 
-st.title("Quote Style Converter (pdf2docx – Global Clean v3)")
-st.caption("Layout-preserving PDF→DOCX with US quotes and deepest cleanup of page-join squares.")
+st.title("UK to US Quote Converter with Optional PDF to DOCX Conversion")
+st.write("Please upload a docx using single-quotes dialogue for conversion to double-quotes dialogue, or upload a PDF of either type for conversion to double-quotes dialogue in a docx.")
 
-with st.container():
-    mode = st.radio("Choose input type", ["DOCX → DOCX (UK → US)", "PDF → DOCX (pdf2docx → US quotes)"])
-    uploaded = st.file_uploader("Upload file", type=["docx","pdf"])
+uploaded = st.file_uploader(
+    "Upload DOCX (single-quotes) or PDF",
+    type=["docx", "pdf"],
+    accept_multiple_files=False,
+    key="file",
+    label_visibility="collapsed"
+)
+
+
 
 if uploaded is not None:
-    if mode.startswith("DOCX"):
-        if not uploaded.name.lower().endswith(".docx"):
-            st.error("Please upload a .docx file for this mode.")
-        elif st.button("Convert DOCX to US quotes"):
-            try:
-                out_bytes = convert_docx_bytes_to_us(uploaded.read())
-                st.success("Converted. Download below.")
-                st.download_button("Download DOCX (US quotes)", out_bytes,
-                    file_name=uploaded.name.rsplit(".",1)[0]+" (US Quotes).docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-            except Exception as e:
-                st.error(f"Conversion failed: {e}")
-    else:
-        if not uploaded.name.lower().endswith(".pdf"):
-            st.error("Please upload a .pdf file for this mode.")
-        elif st.button("Convert PDF → DOCX (pdf2docx → US quotes)"):
-            try:
-                out_bytes = pdf_bytes_to_docx_using_pdf2docx(uploaded.read())
-                st.success("Converted. Download below.")
-                st.download_button("Download DOCX (US quotes)", out_bytes,
-                    file_name=uploaded.name.rsplit(".",1)[0]+" (US Quotes).docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-            except Exception as e:
-                st.error(f"Conversion failed: {e}")
+    # Show a simple file summary and a Convert button
+    st.write(f"Selected file: **{uploaded.name}**")
+    if st.button("Convert"):
+        name_lower = uploaded.name.lower()
+        if name_lower.endswith(".docx"):
+            if Document is None:
+                st.error("python-docx not available; cannot process DOCX.")
+            else:
+                try:
+                    raw = uploaded.read()
+                    out_bytes = docx_bytes_to_us_quotes(raw) if 'docx_bytes_to_us_quotes' in globals() else convert_docx_bytes_to_us(raw)
+                    st.success("Converted. Download below.")
+                    st.download_button("Download File", out_bytes,
+                        file_name=uploaded.name,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                except Exception as e:
+                    st.error(f"Conversion failed: {e}")
+        elif name_lower.endswith(".pdf"):
+            if PDF2DOCXConverter is None:
+                st.error("pdf2docx not available; cannot convert PDF to DOCX.")
+            else:
+                try:
+                    out_bytes = pdf_bytes_to_docx_using_pdf2docx(uploaded.read())
+                    st.success("Converted. Download below.")
+                    base = uploaded.name.rsplit(".",1)[0]
+                    st.download_button("Download File", out_bytes,
+                        file_name=base + ".docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                except Exception as e:
+                    st.error(f"Conversion failed: {e}")
+        else:
+            st.error("Unsupported file type. Please upload a .docx or .pdf.")
 
 
-# === ACBD drop-cap fixer (A=big letter+space, B=normal runs, C=from ALL-CAPS word to next paragraph that has <w:widowControl/>, D=that next paragraph) ===
+# === ACBD drop-cap fixer (internal logic; no UI changes) ===
+# Pattern:
+#   A = single big glyph run (≥1.5× paragraph median size), usually letter + space
+#   B = subsequent normal-sized runs (same paragraph) until C-start
+#   C = runs starting at the first ALL-CAPS word (same paragraph), and logically ending before the next paragraph that has <w:widowControl/>
+#   D = the next paragraph (which has <w:widowControl/>)
+# Reorder paragraph text to: A + C + " " + B (leave D untouched). Multi-pass until stable.
 def _acbd_pt(val, default=None):
     try:
         return float(val.pt) if hasattr(val, "pt") else (float(val) if val is not None else default)
@@ -261,10 +342,12 @@ def _acbd_run_text(run):
     try:
         return "".join(t.text or "" for t in run._element.xpath(".//w:t", namespaces=run._element.nsmap))
     except Exception:
+        # Fallback: python-docx run.text only returns the first text node; try best-effort
         return getattr(run, "text", "") or ""
 
 def _acbd_first_word(s):
-    m = re.search(r"[A-Za-z]+", s or "")
+    import re as _re
+    m = _re.search(r"[A-Za-z]+", s or "")
     return m.group(0) if m else ""
 
 def _acbd_is_all_caps_word(w):
@@ -297,7 +380,7 @@ def _acbd_fix_once_in_paragraph(doc, p_index):
         majority = sum(vals)/len(vals)
     threshold = 1.5 * majority
 
-    # A
+    # A: first run that's a single alphabetic glyph (optionally with space) and large
     A_idx = None
     A_char = None
     for i, r in enumerate(runs):
@@ -320,19 +403,20 @@ def _acbd_fix_once_in_paragraph(doc, p_index):
     if C_start is None:
         return False
 
-    # D begins at next paragraph which must have widowControl (and exists)
+    # Next paragraph must exist and have widowControl (terminates C; D begins there)
     if p_index + 1 >= len(paras):
         return False
     if not _acbd_para_has_widowcontrol(paras[p_index+1]):
         return False
 
-    # B text: runs between A+1 and C_start
+    # B: text between A+1 and C_start
     B_text = "".join(_acbd_run_text(runs[t]) for t in range(A_idx+1, C_start)).strip()
-    # C text: runs from C_start to end of paragraph p_index
+    # C: text from C_start to end of this paragraph
     C_text = "".join(_acbd_run_text(runs[t]) for t in range(C_start, len(runs))).strip()
     if not B_text or not C_text:
         return False
 
+    # New paragraph text: A + C + " " + B  (no space between A and start of C)
     new_text = (A_char.upper() + C_text).strip()
     if B_text:
         new_text += " " + B_text
@@ -354,4 +438,3 @@ def fix_dropcaps_acbd(doc, max_passes=50):
         passes += 1
     return doc
 # === end ACBD fixer ===
-
