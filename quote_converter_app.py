@@ -11,7 +11,7 @@ import io, os, re, tempfile, streamlit as st
 # • Reorder: current paragraph text becomes A + C + " " + B. Repeat until stable.
 # Diagnostics: set ACBD_DIAG = True
 ACBD_GLOBAL_MEDIAN_SIZE = None  # for per-paragraph prints.
-ACBD_DIAG = True
+ACBD_DIAG = False
 ACBD_GLOBAL_MEDIAN_SIZE = None
 ACBD_LOG = []
 
@@ -25,14 +25,14 @@ def _acbd_log(msg: str):
 import statistics as _acbd_stats
 import re as _acbd_re
 
-def _acbd_is_letter_space(txt: str) -> bool:
-    """Return True if txt is exactly: one uppercase A–Z followed by exactly one space (regular or NBSP)."""
-    if txt is None:
-        return False
-    # Preserve spaces; remove control chars
-    t = txt.replace("\u00A0", "\u0020")  # NBSP -> space
-    # Accept exactly two chars: [A-Z][space]
-    return bool(_acbd_re.fullmatch(r"[A-Z] ", t))
+#def _acbd_is_letter_space(txt: str) -> bool:
+#    """Return True if txt is exactly: one uppercase A–Z followed by exactly one space (regular or NBSP)."""
+#    if txt is None:
+#        return False
+#    # Preserve spaces; remove control chars
+#    t = txt.replace("\u00A0", "\u0020")  # NBSP -> space
+#    # Accept exactly two chars: [A-Z][space]
+#    return bool(_acbd_re.fullmatch(r"[A-Z] ", t))
 
 
 def _acbd_pt(val, default=None):
@@ -143,15 +143,16 @@ def _acbd_doc_global_median_size(doc, default=12.0):
         return float(_stats.median(sizes))
     except Exception:
         return sum(sizes)/len(sizes)
-def _acbd_para_median_size(para):
-    sizes = [_acbd_run_size_pt(r, para) for r in para.runs]
-    sizes = [s for s in sizes if s is not None]
-    if not sizes:
-        return 11.0
-    try:
-        return float(_acbd_stats.median(sizes))
-    except Exception:
-        return sum(sizes)/len(sizes)
+
+#def _acbd_para_median_size(para):
+#    sizes = [_acbd_run_size_pt(r, para) for r in para.runs]
+#    sizes = [s for s in sizes if s is not None]
+#    if not sizes:
+#        return 11.0
+#    try:
+#        return float(_acbd_stats.median(sizes))
+#    except Exception:
+#        return sum(sizes)/len(sizes)
 
 def _acbd_fix_once_in_paragraph(doc, p_index):
     paras = doc.paragraphs
