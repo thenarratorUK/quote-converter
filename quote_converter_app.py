@@ -290,7 +290,7 @@ def acbd_write_log(sidecar_path=None):
     try:
         with open(path, "w", encoding="utf-8") as f:
             for line in ACBD_LOG:
-                f.write(line.rstrip("\n") + "\n")
+                f.write(line.rstrip("n") + "n")
     except Exception as e:
         try:
             print(f"[ACBD] failed to write log: {e}")
@@ -386,7 +386,7 @@ def normalize_quotes_to_us(text: str) -> str:
                 else:
                     out.append(ch)
             return "".join(out)
-        text = "\n".join(smarten_line(ln) for ln in text.split("\n"))
+        text = "n".join(smarten_line(ln) for ln in text.split("n"))
     return text.replace(APOS, "’")
 
 def convert_docx_runs_to_us(doc: Document) -> None:
@@ -564,7 +564,7 @@ input[type="file"] {
 }
 
 """
-st.markdown("<style>\n"+CSS+"\n</style>", unsafe_allow_html=True)
+st.markdown("<style>n"+CSS+"n</style>", unsafe_allow_html=True)
 
 st.title("UK to US Quote Converter with Optional PDF to DOCX Conversion")
 st.write("Please upload a docx using single-quotes dialogue for conversion to double-quotes dialogue, or upload a PDF of either type for conversion to double-quotes dialogue in a docx.")
@@ -656,7 +656,7 @@ def convert_docx_bytes_to_epub3(docx_bytes: bytes, title: str = "Document", auth
             return
         sec_count += 1
         fname = f"section_{sec_count}.xhtml"
-        html_body = "\\n".join(current_blocks)
+        html_body = "\n".join(current_blocks)
         sections.append({"id": f"sec{sec_count}", "title": current_title or f"Section {sec_count}", "level": current_level, "filename": fname, "body": html_body})
         current_blocks = []
         current_title = ""
@@ -666,7 +666,7 @@ def convert_docx_bytes_to_epub3(docx_bytes: bytes, title: str = "Document", auth
         text = html.escape(run.text or "")
         if not text:
             return ""
-        inner = text.replace("\\n", "<br/>")
+        inner = text.replace("\n", "<br/>")
         style_fragments = []
         try:
             if run.font and run.font.size:
@@ -685,9 +685,9 @@ def convert_docx_bytes_to_epub3(docx_bytes: bytes, title: str = "Document", auth
         if run.italic:
             inner = f"<em>{inner}</em>"
         if run.underline:
-            inner = f"<span style=\\"text-decoration:underline;\\">{inner}</span>"
+            inner = f"<span style=\text-decoration:underline;\>{inner}</span>"
         if style_fragments:
-            inner = f"<span style=\\"{';'.join(style_fragments)}\\">{inner}</span>"
+            inner = f"<span style=\{';'.join(style_fragments)}\>{inner}</span>"
         return inner
 
     for p in doc.paragraphs:
@@ -733,7 +733,7 @@ def convert_docx_bytes_to_epub3(docx_bytes: bytes, title: str = "Document", auth
     if fonts_used:
         ff = ", ".join(f"'{html.escape(n)}'" for n in fonts_used)
         css_lines.append(f"body {{ font-family: {ff}, serif; }}")
-    css_text = ("\\n".join(css_lines)).encode("utf-8")
+    css_text = ("\n".join(css_lines)).encode("utf-8")
 
     xhtml_items = []
     for s in sections:
@@ -780,7 +780,7 @@ def convert_docx_bytes_to_epub3(docx_bytes: bytes, title: str = "Document", auth
             prev_level = level
         close_ol()
         html_parts.append("</nav>")
-        return "\\n".join(html_parts)
+        return "\n".join(html_parts)
 
     nav_html_body = f"""<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
@@ -815,9 +815,9 @@ def convert_docx_bytes_to_epub3(docx_bytes: bytes, title: str = "Document", auth
 
     manifest_items.append(("styles", "styles.css", "text/css", ""))
 
-    manifest_xml = "\\n".join([f'    <item id="{html.escape(item[0])}" href="{html.escape(item[1])}" media-type="{html.escape(item[2])}" {item[3]}/>' for item in manifest_items])
+    manifest_xml = "\n".join([f'    <item id="{html.escape(item[0])}" href="{html.escape(item[1])}" media-type="{html.escape(item[2])}" {item[3]}/>' for item in manifest_items])
 
-    spine_xml = "\\n".join([f'    <itemref idref="{html.escape(i)}"/>' for i in spine_items])
+    spine_xml = "\n".join([f'    <itemref idref="{html.escape(i)}"/>' for i in spine_items])
 
     content_opf = f'''<?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" unique-identifier="uid" version="3.0" xml:lang="en">
@@ -843,7 +843,7 @@ def convert_docx_bytes_to_epub3(docx_bytes: bytes, title: str = "Document", auth
         zinfo = zipfile.ZipInfo("mimetype")
         zinfo.compress_type = zipfile.ZIP_STORED
         zf.writestr(zinfo, b"application/epub+zip")
-        zf.writestr("META-INF/container.xml", '<?xml version="1.0"?>\\n<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>')
+        zf.writestr("META-INF/container.xml", '<?xml version="1.0"?>\n<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>')
         zf.writestr("OEBPS/styles.css", css_text)
         for path, blob, ctype, item_id in image_items:
             zf.writestr(path, blob)
