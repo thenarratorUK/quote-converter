@@ -585,7 +585,64 @@ if uploaded is not None:
     if st.button("Convert"):
         name_lower = uploaded.name.lower()
         
-if name_lower.endswith(".docx"):
+# DOCX branch (robust extension/type check; no reliance on name_lower)
+if uploaded is not None and (
+    str(getattr(uploaded, "name", "")).lower().endswith(".docx")
+    or getattr(uploaded, "type", "") in (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/msword",
+    )
+):
+    if Document is None:
+        st.error("python-docx not available; cannot process DOCX.")
+    else:
+        try:
+            raw = uploaded.read()
+            out_bytes = (
+                docx_bytes_to_us_quotes(raw)
+                if 'docx_bytes_to_us_quotes' in globals()
+                else (
+                    convert_docx_bytes_to_us(raw)
+                    if 'convert_docx_bytes_to_us' in globals()
+                    else raw
+                )
+            )
+
+            st.success("Converted. Download below.")
+            st.download_button(
+                "Download DOCX",
+                out_bytes,
+                file_name=getattr(uploaded, "name", "converted.docx"),
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+
+            # Always try to generate EPUB 3; silently skip only on hard failure
+            try:
+                base = str(getattr(uploaded, "name", "document")).rsplit(".", 1)[0]
+                try:
+                    author_meta = (
+                        getattr(_Document(io.BytesIO(out_bytes)).core_properties, "author", None)
+                        or "Unknown"
+                    )
+                except Exception:
+                    author_meta = "Unknown"
+
+                if 'convert_docx_bytes_to_epub3' in globals():
+                    epub_bytes = convert_docx_bytes_to_epub3(out_bytes, title=base, author=author_meta)
+                    st.download_button(
+                        "Download EPUB (EPUB 3, split chapters & TOC)",
+                        epub_bytes,
+                        file_name=base + ".epub",
+                        mime="application/epub+zip",
+                    )
+                else:
+                    pass
+            except Exception:
+                pass
+
+        except Exception as e:
+            st.error("Conversion failed: %s" % e)
+
     if Document is None:
         st.error("python-docx not available; cannot process DOCX.")
     else:
@@ -610,12 +667,12 @@ if name_lower.endswith(".docx"):
             )
 
             try:
-
                 base = uploaded.name.rsplit(".", 1)[0]
-                # Try to extract author from DOCX metadata; fall back to Unknown
                 try:
-                    import io as _io_local
-                    author_meta = getattr(_Document(_io_local.BytesIO(out_bytes)).core_properties, "author", None) or "Unknown"
+                    author_meta = (
+                        getattr(_Document(io.BytesIO(out_bytes)).core_properties, "author", None)
+                        or "Unknown"
+                    )
                 except Exception:
                     author_meta = "Unknown"
 
@@ -626,7 +683,6 @@ if name_lower.endswith(".docx"):
                     file_name=base + ".epub",
                     mime="application/epub+zip",
                 )
-    
             except Exception as epub_exc:
                 st.warning(f"EPUB generation failed: {epub_exc}")
 
