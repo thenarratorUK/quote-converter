@@ -585,7 +585,71 @@ if uploaded is not None:
     if st.button("Convert"):
         name_lower = uploaded.name.lower()
         
-# DOCX branch (robust extension/type check; no reliance on name_lower)
+# DOCX branch (robust; no reliance on name_lower; validates ZIP before using python-docx)
+if uploaded is not None and (
+    str(getattr(uploaded, "name", "")).lower().endswith(".docx")
+    or getattr(uploaded, "type", "") in (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/msword",
+    )
+):
+    if Document is None:
+        st.error("python-docx not available; cannot process DOCX.")
+    else:
+        try:
+            raw = uploaded.read()
+            def _is_zip(b: bytes) -> bool:
+                return isinstance(b, (bytes, bytearray)) and len(b) >= 4 and b[:2] == b"PK"
+
+            # Produce DOCX bytes via your existing converter if present
+            out_bytes = (
+                docx_bytes_to_us_quotes(raw)
+                if 'docx_bytes_to_us_quotes' in globals()
+                else (
+                    convert_docx_bytes_to_us(raw)
+                    if 'convert_docx_bytes_to_us' in globals()
+                    else raw
+                )
+            )
+
+            st.success("Converted. Download below.")
+            st.download_button(
+                "Download DOCX",
+                out_bytes,
+                file_name=getattr(uploaded, "name", "converted.docx"),
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+
+            # Build EPUB 3 from DOCX bytes. Prefer converted DOCX if it is a valid ZIP; else fall back to original raw bytes.
+            try:
+                docx_for_epub = out_bytes if _is_zip(out_bytes) else raw
+                if not _is_zip(docx_for_epub):
+                    raise ValueError("Uploaded file is not a valid DOCX (ZIP) stream")
+
+                base = str(getattr(uploaded, "name", "document")).rsplit(".", 1)[0]
+                # Extract author metadata only from a valid ZIP
+                try:
+                    author_meta = (
+                        getattr(_Document(io.BytesIO(docx_for_epub)).core_properties, "author", None)
+                        or "Unknown"
+                    )
+                except Exception:
+                    author_meta = "Unknown"
+
+                if 'convert_docx_bytes_to_epub3' in globals():
+                    epub_bytes = convert_docx_bytes_to_epub3(docx_for_epub, title=base, author=author_meta)
+                    st.download_button(
+                        "Download EPUB (EPUB 3, split chapters & TOC)",
+                        epub_bytes,
+                        file_name=base + ".epub",
+                        mime="application/epub+zip",
+                    )
+            except Exception:
+                # Non-fatal: keep DOCX button visible if EPUB creation fails
+                pass
+
+        except Exception as e:
+            st.error("Conversion failed: %s" % e)
 if uploaded is not None and (
     str(getattr(uploaded, "name", "")).lower().endswith(".docx")
     or getattr(uploaded, "type", "") in (
