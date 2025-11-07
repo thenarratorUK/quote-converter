@@ -290,7 +290,144 @@ def acbd_write_log(sidecar_path=None):
     try:
         with open(path, "w", encoding="utf-8") as f:
             for line in ACBD_LOG:
-                f.write(line.rstrip("\n") + "\n")
+                f.write(line.rstrip("\
+# === DOCX -> EPUB 3 (from *converted* DOCX bytes) ===
+def docx_bytes_to_epub3(docx_bytes: bytes, split_on_heading=True):
+    """
+    Convert DOCX (bytes) -> minimal EPUB 3 (bytes).
+    - Splits chapters on 'Heading 1' / 'Heading 2' paragraph styles when available.
+    - Falls back to a single chapter if no headings are found.
+    The EPUB 3 includes: mimetype, META-INF/container.xml, OEBPS/content.opf, OEBPS/nav.xhtml, OEBPS/chapter-*.xhtml
+    """
+    import zipfile, io, xml.etree.ElementTree as ET, html, datetime, uuid
+    
+    # Extract main document.xml (and optionally styles.xml) from DOCX
+    zf = zipfile.ZipFile(io.BytesIO(docx_bytes), "r")
+    try:
+        doc_xml = zf.read("word/document.xml")
+    except KeyError:
+        raise RuntimeError("DOCX missing word/document.xml")
+    styles_xml = None
+    try:
+        styles_xml = zf.read("word/styles.xml")
+    except KeyError:
+        styles_xml = None
+    
+    # Namespaces
+    NS = {
+        "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    }
+    ET.register_namespace('', "http://www.w3.org/1999/xhtml")
+    
+    # Parse document
+    root = ET.fromstring(doc_xml)
+    
+    # Map styleId -> human-readable name (e.g., 'Heading 1')
+    style_name_by_id = {}
+    if styles_xml:
+        sroot = ET.fromstring(styles_xml)
+        for s in sroot.findall(".//w:style", NS):
+            sid = s.get("{%s}styleId" % NS["w"])
+            name_el = s.find(".//w:name", NS)
+            if sid and name_el is not None and name_el.get("{%s}val" % NS["w"]):
+                style_name_by_id[sid] = name_el.get("{%s}val" % NS["w"])
+    
+    # Walk paragraphs, grouping into chapters by Heading 1/2
+    chapters = []
+    current_title = None
+    current_paras = []
+    
+    def flush_chapter():
+        if current_paras or current_title is not None:
+            body_html = "".join(current_paras).strip() or "<p></p>"
+            title = current_title or "Untitled"
+            chapters.append((title, body_html))
+    
+    for p in root.findall(".//w:p", NS):
+        # Determine paragraph style
+        pStyle = None
+        pPr = p.find("w:pPr", NS)
+        if pPr is not None:
+            ps = pPr.find("w:pStyle", NS)
+            if ps is not None and ps.get("{%s}val" % NS["w"]):
+                pStyle = ps.get("{%s}val" % NS["w"])
+        style_name = style_name_by_id.get(pStyle, "")
+        
+        # Extract plain text (with runs)
+        texts = []
+        for r in p.findall(".//w:t", NS):
+            texts.append(r.text or "")
+        text = "".join(texts).strip()
+        if not text:
+            # Blank paragraph -> line break
+            current_paras.append("<p></p>")
+            continue
+        
+        # If a Heading 1/2 starts a new chapter
+        if split_on_heading and (style_name.lower().startswith("heading 1") or style_name.lower().startswith("heading 2")):
+            # flush previous
+            flush_chapter()
+            current_title = html.escape(text)
+            current_paras = []
+        else:
+            current_paras.append("<p>%s</p>" % html.escape(text))
+    
+    # flush last
+    flush_chapter()
+    if not chapters:
+        # Fallback single chapter with whole text
+        body_texts = []
+        for p in root.findall(".//w:p", NS):
+            texts = [t.text or "" for t in p.findall(".//w:t", NS)]
+            t = "".join(texts).strip()
+            if t:
+                body_texts.append("<p>%s</p>" % html.escape(t))
+        chapters = [("Document", "".join(body_texts) or "<p></p>")]
+    
+    # Build EPUB 3 structure in-memory
+    book_id = "urn:uuid:" + str(uuid.uuid4())
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    
+    def make_opf(n_items):
+        manifest_items = []
+        spine_items = []
+        for i in range(n_items):
+            manifest_items.append('<item id="c%s" href="chapter-%s.xhtml" media-type="application/xhtml+xml"/>' % (i+1, i+1))
+            spine_items.append('<itemref idref="c%s"/>' % (i+1))
+        manifest = "\n      ".join(manifest_items + ['<item id="nav" href="nav.xhtml" properties="nav" media-type="application/xhtml+xml"/>'])
+        spine = "\n      ".join(spine_items)
+        return '<?xml version="1.0" encoding="utf-8"?>\n<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="pub-id">\n  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n    <dc:identifier id="pub-id">%s</dc:identifier>\n    <dc:title>Converted Document</dc:title>\n    <dc:language>en</dc:language>\n    <meta property="dcterms:modified">%s</meta>\n  </metadata>\n  <manifest>\n      %s\n  </manifest>\n  <spine>\n      %s\n  </spine>\n</package>' % (book_id, now, manifest, spine)
+    
+    def make_nav(chapters):
+        lis = []
+        for i, (title, _) in enumerate(chapters, 1):
+            t = title or "Chapter %s" % i
+            lis.append('<li><a href="chapter-%s.xhtml">%s</a></li>' % (i, t))
+        ol = "\n        ".join(lis)
+        return '<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>\n<html xmlns="http://www.w3.org/1999/xhtml">\n  <head><title>Table of Contents</title><meta charset="utf-8"/></head>\n  <body>\n    <nav epub:type="toc" id="toc">\n      <h2>Contents</h2>\n      <ol>\n        %s\n      </ol>\n    </nav>\n  </body>\n</html>' % ol
+    
+    def make_chapter(title, body):
+        return '<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>\n<html xmlns="http://www.w3.org/1999/xhtml">\n  <head><title>%s</title><meta charset="utf-8"/></head>\n  <body>\n    <h1>%s</h1>\n    %s\n  </body>\n</html>' % (title, title, body)
+    
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as ez:
+        # 'mimetype' must be first and STORED (no compression)
+        zinfo = zipfile.ZipInfo("mimetype")
+        zinfo.compress_type = zipfile.ZIP_STORED
+        ez.writestr(zinfo, "application/epub+zip")
+        
+        # container.xml
+        ez.writestr("META-INF/container.xml",
+                    '<?xml version="1.0"?>\n<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">\n  <rootfiles>\n    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>\n  </rootfiles>\n</container>')
+        # OPF, NAV, chapters
+        chapters_count = len(chapters)
+        ez.writestr("OEBPS/content.opf", make_opf(chapters_count))
+        ez.writestr("OEBPS/nav.xhtml", make_nav(chapters))
+        for i, (title, body) in enumerate(chapters, 1):
+            ez.writestr("OEBPS/chapter-%s.xhtml" % i, make_chapter(title, body))
+    
+    return out.getvalue()
+n") + "\n")
     except Exception as e:
         try:
             print(f"[ACBD] failed to write log: {e}")
@@ -584,460 +721,40 @@ if uploaded is not None:
     st.write(f"Selected file: **{uploaded.name}**")
     if st.button("Convert"):
         name_lower = uploaded.name.lower()
-        
-# DOCX branch (robust; single error path; no reliance on name_lower)
-if uploaded is not None and (
-    str(getattr(uploaded, "name", "")).lower().endswith(".docx")
-    or getattr(uploaded, "type", "") in (
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "application/msword",
-    )
-):
-    if Document is None:
-        st.error("python-docx not available; cannot process DOCX.")
-    else:
-        # Read the upload ONCE to avoid empty reads later
-        raw = uploaded.getvalue() if hasattr(uploaded, 'getvalue') else uploaded.read()
-
-        # Convert to cleaned DOCX bytes (if your converter exists). This should not error on non-ZIP.
-        try:
-            out_bytes = (
-                docx_bytes_to_us_quotes(raw)
-                if 'docx_bytes_to_us_quotes' in globals()
-                else (
-                    convert_docx_bytes_to_us(raw)
-                    if 'convert_docx_bytes_to_us' in globals()
-                    else raw
-                )
-            )
-        except Exception as conv_exc:
-            st.error("Conversion failed: %s" % conv_exc)
-            out_bytes = raw  # still allow EPUB attempt if raw is valid DOCX
-
-        # Always show DOCX download (whatever bytes we produced)
-        st.success("Converted. Download below.")
-        st.download_button(
-            "Download DOCX",
-            out_bytes,
-            file_name=getattr(uploaded, "name", "converted.docx"),
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
-
-        # EPUB 3 generation: validate ZIP before python-docx; failures are WARNING-only, not ERROR
-        try:
-            def _is_zip(b):
-                return isinstance(b, (bytes, bytearray)) and len(b) >= 4 and b[:2] == b'PK'
-
-            docx_for_epub = out_bytes if _is_zip(out_bytes) else raw
-            if not _is_zip(docx_for_epub):
-                raise ValueError('Uploaded file is not a valid DOCX (ZIP) stream')
-
-            base = str(getattr(uploaded, 'name', 'document')).rsplit('.', 1)[0]
-            try:
-                author_meta = (
-                    getattr(_Document(io.BytesIO(docx_for_epub)).core_properties, 'author', None)
-                    or 'Unknown'
-                )
-            except Exception:
-                author_meta = 'Unknown'
-
-            if 'convert_docx_bytes_to_epub3' in globals():
-                epub_bytes = convert_docx_bytes_to_epub3(docx_for_epub, title=base, author=author_meta)
-                st.download_button(
-                    "Download EPUB (EPUB 3, split chapters & TOC)",
-                    epub_bytes,
-                    file_name=base + '.epub',
-                    mime='application/epub+zip',
-                )
-        except Exception as epub_exc:
-            st.warning('EPUB generation skipped: %s' % epub_exc)
-if uploaded is not None and (
-    str(getattr(uploaded, "name", "")).lower().endswith(".docx")
-    or getattr(uploaded, "type", "") in (
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "application/msword",
-    )
-):
-    if Document is None:
-        st.error("python-docx not available; cannot process DOCX.")
-    else:
-        try:
-            raw = uploaded.read()
-            def _is_zip(b: bytes) -> bool:
-                return isinstance(b, (bytes, bytearray)) and len(b) >= 4 and b[:2] == b"PK"
-
-            # Produce DOCX bytes via your existing converter if present
-            out_bytes = (
-                docx_bytes_to_us_quotes(raw)
-                if 'docx_bytes_to_us_quotes' in globals()
-                else (
-                    convert_docx_bytes_to_us(raw)
-                    if 'convert_docx_bytes_to_us' in globals()
-                    else raw
-                )
-            )
-
-            st.success("Converted. Download below.")
-            st.download_button(
-                "Download DOCX",
-                out_bytes,
-                file_name=getattr(uploaded, "name", "converted.docx"),
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            )
-
-            # Build EPUB 3 from DOCX bytes. Prefer converted DOCX if it is a valid ZIP; else fall back to original raw bytes.
-            try:
-                docx_for_epub = out_bytes if _is_zip(out_bytes) else raw
-                if not _is_zip(docx_for_epub):
-                    raise ValueError("Uploaded file is not a valid DOCX (ZIP) stream")
-
-                base = str(getattr(uploaded, "name", "document")).rsplit(".", 1)[0]
-                # Extract author metadata only from a valid ZIP
+        if name_lower.endswith(".docx"):
+            if Document is None:
+                st.error("python-docx not available; cannot process DOCX.")
+            else:
                 try:
-                    author_meta = (
-                        getattr(_Document(io.BytesIO(docx_for_epub)).core_properties, "author", None)
-                        or "Unknown"
-                    )
-                except Exception:
-                    author_meta = "Unknown"
+                    raw = uploaded.read()
+                    out_bytes = docx_bytes_to_us_quotes(raw) if 'docx_bytes_to_us_quotes' in globals() else convert_docx_bytes_to_us(raw)
+                    st.success("Converted. Download below.")
+                    st.download_button("Download File", out_bytes,
+                        file_name=uploaded.name,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                    # Auto-generate EPUB 3 from the *converted* DOCX
+                    try:
+                        epub_bytes = docx_bytes_to_epub3(out_bytes)
+                        st.download_button("Download EPUB 3", epub_bytes,
+                            file_name=uploaded.name.rsplit(".",1)[0] + ".epub",
+                            mime="application/epub+zip")
+                    except Exception as _epub_err:
+                        st.warning(f"EPUB generation skipped: {_epub_err}")
 
-                if 'convert_docx_bytes_to_epub3' in globals():
-                    epub_bytes = convert_docx_bytes_to_epub3(docx_for_epub, title=base, author=author_meta)
-                    st.download_button(
-                        "Download EPUB (EPUB 3, split chapters & TOC)",
-                        epub_bytes,
-                        file_name=base + ".epub",
-                        mime="application/epub+zip",
-                    )
-            except Exception:
-                # Non-fatal: keep DOCX button visible if EPUB creation fails
-                pass
-
-        except Exception as e:
-            st.error("Conversion failed: %s" % e)
-if uploaded is not None and (
-    str(getattr(uploaded, "name", "")).lower().endswith(".docx")
-    or getattr(uploaded, "type", "") in (
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "application/msword",
-    )
-):
-    if Document is None:
-        st.error("python-docx not available; cannot process DOCX.")
-    else:
-        try:
-            raw = uploaded.read()
-            out_bytes = (
-                docx_bytes_to_us_quotes(raw)
-                if 'docx_bytes_to_us_quotes' in globals()
-                else (
-                    convert_docx_bytes_to_us(raw)
-                    if 'convert_docx_bytes_to_us' in globals()
-                    else raw
-                )
-            )
-
-            st.success("Converted. Download below.")
-            st.download_button(
-                "Download DOCX",
-                out_bytes,
-                file_name=getattr(uploaded, "name", "converted.docx"),
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            )
-
-            # Always try to generate EPUB 3; silently skip only on hard failure
-            try:
-                base = str(getattr(uploaded, "name", "document")).rsplit(".", 1)[0]
+                except Exception as e:
+                    st.error(f"Conversion failed: {e}")
+        elif name_lower.endswith(".pdf"):
+            if PDF2DOCXConverter is None:
+                st.error("pdf2docx not available; cannot convert PDF to DOCX.")
+            else:
                 try:
-                    author_meta = (
-                        getattr(_Document(io.BytesIO(out_bytes)).core_properties, "author", None)
-                        or "Unknown"
-                    )
-                except Exception:
-                    author_meta = "Unknown"
-
-                if 'convert_docx_bytes_to_epub3' in globals():
-                    epub_bytes = convert_docx_bytes_to_epub3(out_bytes, title=base, author=author_meta)
-                    st.download_button(
-                        "Download EPUB (EPUB 3, split chapters & TOC)",
-                        epub_bytes,
-                        file_name=base + ".epub",
-                        mime="application/epub+zip",
-                    )
-                else:
-                    pass
-            except Exception:
-                pass
-
-        except Exception as e:
-            st.error("Conversion failed: %s" % e)
-
-    if Document is None:
-        st.error("python-docx not available; cannot process DOCX.")
-    else:
-        try:
-            raw = uploaded.read()
-            out_bytes = (
-                docx_bytes_to_us_quotes(raw)
-                if 'docx_bytes_to_us_quotes' in globals()
-                else (
-                    convert_docx_bytes_to_us(raw)
-                    if 'convert_docx_bytes_to_us' in globals()
-                    else raw
-                )
-            )
-
-            st.success("Converted. Download below.")
-            st.download_button(
-                "Download DOCX",
-                out_bytes,
-                file_name=uploaded.name,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            )
-
-            try:
-                base = uploaded.name.rsplit(".", 1)[0]
-                try:
-                    author_meta = (
-                        getattr(_Document(io.BytesIO(out_bytes)).core_properties, "author", None)
-                        or "Unknown"
-                    )
-                except Exception:
-                    author_meta = "Unknown"
-
-                epub_bytes = convert_docx_bytes_to_epub3(out_bytes, title=base, author=author_meta)
-                st.download_button(
-                    "Download EPUB (EPUB 3, split chapters & TOC)",
-                    epub_bytes,
-                    file_name=base + ".epub",
-                    mime="application/epub+zip",
-                )
-            except Exception as epub_exc:
-                st.warning(f"EPUB generation failed: {epub_exc}")
-
-        except Exception as e:
-            st.error(f"Conversion failed: {e}")
-# --- START: DOCX -> EPUB 3 converter (preserve formatting, images, split chapters by heading hierarchy) ---
-import zipfile, uuid, datetime, html, mimetypes, io, os, re
-from docx import Document as _Document
-
-def _safe_filename(s: str) -> str:
-    return re.sub(r'[^A-Za-z0-9_.-]', '_', s)[:200]
-
-def convert_docx_bytes_to_epub3(docx_bytes: bytes, title: str = "Document", author: str = "Unknown") -> bytes:
-    """Convert DOCX bytes to an EPUB 3.0 package (bytes).
-    - Splits into chapters by heading hierarchy.
-    - Preserves inline formatting and images.
-    - Generates nav.xhtml TOC (EPUB 3).
-    """
-    doc = _Document(io.BytesIO(docx_bytes))
-
-    images = {}
-    for rel in doc.part._rels:
-        part = doc.part._rels[rel].target_part
-        if getattr(part, "content_type", "").startswith("image/"):
-            import mimetypes as _mt
-            ext = _mt.guess_extension(part.content_type) or ""
-            fname = _safe_filename(rel) + ext
-            images[rel] = (fname, part.blob, part.content_type)
-
-    sections = []
-    current_blocks, current_title, current_level = [], title, 0
-    sec_count = 0
-
-    def flush_section():
-        nonlocal sec_count, current_blocks, current_title, current_level
-        if not current_blocks:
-            return
-        sec_count += 1
-        fname = f"section_{sec_count}.xhtml"
-        html_body = "\n".join(current_blocks)
-        sections.append({"id": f"sec{sec_count}", "title": current_title or f"Section {sec_count}", "level": current_level, "filename": fname, "body": html_body})
-        current_blocks, current_title, current_level = [], "", 0
-
-    def render_run(run):
-        import html as _html
-        text = _html.escape(run.text or "")
-        if not text:
-            return ""
-        inner = text.replace("\n", "<br/>")
-        styles = []
-        try:
-            if run.font and run.font.size:
-                size_pt = run.font.size.pt
-                size_px = int(size_pt * 1.3333)
-                styles.append(f"font-size:{size_px}px")
-        except Exception:
-            pass
-        try:
-            if run.font and run.font.name:
-                styles.append(f"font-family:'{_html.escape(run.font.name)}'")
-        except Exception:
-            pass
-        if run.bold:
-            inner = f"<strong>{inner}</strong>"
-        if run.italic:
-            inner = f"<em>{inner}</em>"
-        if run.underline:
-            inner = f"<span style=\"text-decoration:underline;\">{inner}</span>"
-        if styles:
-            inner = f"<span style=\"{';'.join(styles)}\">{inner}</span>"
-        return inner
-
-    for p in doc.paragraphs:
-        style_name = (p.style.name.lower() if p.style and p.style.name else "").strip()
-        is_heading, heading_level = False, None
-        m = re.match(r'heading\s*(\d+)', style_name)
-        if m:
-            is_heading, heading_level = True, int(m.group(1))
-        if style_name in ("title",):
-            is_heading, heading_level = True, 1
-        if is_heading:
-            if current_blocks:
-                flush_section()
-            current_title, current_level = p.text.strip() or title, (heading_level or 1)
-            lvl = 1 if current_level is None else min(6, current_level)
-            runs_html = "".join(render_run(r) for r in p.runs)
-            current_blocks.append(f"<h{lvl}>{runs_html or p.text}</h{lvl}>")
+                    out_bytes = pdf_bytes_to_docx_using_pdf2docx(uploaded.read())
+                    st.success("Converted. Download below.")
+                    base = uploaded.name.rsplit(".",1)[0]
+                    st.download_button("Download File", out_bytes,
+                        file_name=base + ".docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                except Exception as e:
+                    st.error(f"Conversion failed: {e}")
         else:
-            runs_html = "".join(render_run(r) for r in p.runs)
-            if runs_html.strip():
-                current_blocks.append(f"<p>{runs_html}</p>")
-
-    if current_blocks:
-        flush_section()
-    if not sections:
-        sections.append({"id": "sec1", "title": title, "level": 0, "filename": "section_1.xhtml", "body": "<p></p>"})
-
-    # CSS hints
-    fonts_used = set()
-    for p in doc.paragraphs:
-        for r in p.runs:
-            try:
-                if r.font and r.font.name:
-                    fonts_used.add(r.font.name)
-            except Exception:
-                pass
-    css_lines = []
-    if fonts_used:
-        ff = ", ".join(f"'{f}'" for f in fonts_used)
-        css_lines.append(f"body {{ font-family: {ff}, serif; }}")
-    css_text = "\n".join(css_lines).encode("utf-8")
-
-    # Build XHTML files
-    xhtml_items = []
-    for s in sections:
-        content = f"""<?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <title>{s['title']}</title>
-    <meta name="viewport" content="width=device-width,initial-scale=1"/>
-    <link rel="stylesheet" href="styles.css" />
-  </head>
-  <body>
-    {s['body']}
-  </body>
-</html>
-"""
-        xhtml_items.append((f"OEBPS/{s['filename']}", content.encode("utf-8"), s['id']))
-
-    # Images
-    image_items = []
-    for rel_id, (fname, blob, ctype) in images.items():
-        path = f"OEBPS/images/{fname}"
-        image_items.append((path, blob, ctype, _safe_filename(fname)))
-
-    # nav.xhtml
-    nav_entries = [(s['filename'], s['title'], s['level']) for s in sections]
-    def build_nav_html(entries):
-        parts = []
-        parts.append('<nav epub:type="toc" id="toc"><h1>Table of Contents</h1>')
-        def open_ol(): parts.append("<ol>")
-        def close_ol(): parts.append("</ol>")
-        if entries:
-            open_ol()
-            prev = entries[0][2] or 1
-            for fname, title, level in entries:
-                level = level or 1
-                if level > prev:
-                    for _ in range(level - prev):
-                        open_ol()
-                elif level < prev:
-                    for _ in range(prev - level):
-                        close_ol()
-                parts.append(f'<li><a href="{fname}">{title}</a></li>')
-                prev = level
-            close_ol()
-        parts.append("</nav>")
-        return "\n".join(parts)
-
-    nav_html_body = f"""<?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <title>Table of Contents</title>
-    <link rel="stylesheet" href="styles.css" />
-  </head>
-  <body>
-    {build_nav_html(nav_entries)}
-  </body>
-</html>
-""".encode("utf-8")
-
-    # OPF (EPUB 3)
-    import uuid as _uuid, datetime as _dt
-    uid = str(_uuid.uuid4())
-    now = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    manifest_items = [("nav", "nav.xhtml", "application/xhtml+xml", 'properties="nav"')]
-    spine_items = []
-    for fname, _, item_id in xhtml_items:
-        href = fname.replace("OEBPS/", "")
-        manifest_items.append((item_id, href, "application/xhtml+xml", ""))
-        spine_items.append(item_id)
-    for path, blob, ctype, item_id in image_items:
-        href = path.replace("OEBPS/", "")
-        manifest_items.append((item_id, href, ctype, ""))
-    manifest_items.append(("styles", "styles.css", "text/css", ""))
-
-    manifest_xml = "\n".join([f'    <item id="{i}" href="{h}" media-type="{mt}" {props}/>' for (i, h, mt, props) in manifest_items])
-    spine_xml = "\n".join([f'    <itemref idref="{i}"/>' for i in spine_items])
-
-    content_opf = f"""<?xml version="1.0" encoding="utf-8"?>
-<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="uid" version="3.0" xml:lang="en">
-  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-    <dc:title>{title}</dc:title>
-    <dc:language>en</dc:language>
-    <dc:identifier id="uid">{uid}</dc:identifier>
-    <dc:creator>{author}</dc:creator>
-    <dc:date>{now}</dc:date>
-  </metadata>
-  <manifest>
-{manifest_xml}
-  </manifest>
-  <spine>
-{spine_xml}
-  </spine>
-</package>
-""".encode("utf-8")
-
-    out = io.BytesIO()
-    import zipfile as _zip
-    with _zip.ZipFile(out, "w", compression=_zip.ZIP_DEFLATED) as zf:
-        zinfo = _zip.ZipInfo("mimetype")
-        zinfo.compress_type = _zip.ZIP_STORED
-        zf.writestr(zinfo, b"application/epub+zip")
-        zf.writestr("META-INF/container.xml", '<?xml version="1.0"?>\n<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>')
-        zf.writestr("OEBPS/styles.css", css_text)
-        for path, blob, ctype, item_id in image_items:
-            zf.writestr(path, blob)
-        for fname, body, _ in xhtml_items:
-            zf.writestr(fname, body)
-        zf.writestr("OEBPS/nav.xhtml", nav_html_body)
-        zf.writestr("OEBPS/content.opf", content_opf)
-    return out.getvalue()
-# --- END: DOCX -> EPUB 3 converter ---
-
+            st.error("Unsupported file type. Please upload a .docx or .pdf.")
