@@ -2,9 +2,10 @@ import io, os, re, tempfile, streamlit as st
 
 # === DOCX -> EPUB 3 (from *converted* DOCX bytes) ===
 def docx_bytes_to_epub3(docx_bytes: bytes, split_on_heading=True):
-    """Convert DOCX bytes to a minimal EPUB 3 package (bytes)."""
+    """Convert DOCX bytes to a minimal EPUB 3 that preserves bold/italics."""
     import zipfile, io, xml.etree.ElementTree as ET, html, datetime, uuid
-    # Read DOCX XML
+
+    # Unzip DOCX parts
     zf = zipfile.ZipFile(io.BytesIO(docx_bytes), "r")
     try:
         doc_xml = zf.read("word/document.xml")
@@ -14,8 +15,12 @@ def docx_bytes_to_epub3(docx_bytes: bytes, split_on_heading=True):
         styles_xml = zf.read("word/styles.xml")
     except KeyError:
         styles_xml = None
+
     NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+
     root = ET.fromstring(doc_xml)
+
+    # styleId -> human-readable style name (e.g., "Heading 1")
     style_name_by_id = {}
     if styles_xml:
         sroot = ET.fromstring(styles_xml)
@@ -24,7 +29,502 @@ def docx_bytes_to_epub3(docx_bytes: bytes, split_on_heading=True):
             name_el = s.find(".//w:name", NS)
             if sid and name_el is not None and name_el.get("{%s}val" % NS["w"]):
                 style_name_by_id[sid] = name_el.get("{%s}val" % NS["w"])
-    chapters, current_title, current_paras = [], None, []
+
+    def runs_to_inline_html(p_el):
+        """Return HTML for a paragraph, preserving <strong>/<em>, line breaks and tabs."""
+        out = []
+        for node in list(p_el):
+            tag = getattr(node, "tag", None)
+            if tag == "{%s}r" % NS["w"]:
+                rPr = node.find("w:rPr", NS)
+                is_bold = rPr is not None and rPr.find("w:b", NS) is not None
+                is_italic = rPr is not None and rPr.find("w:i", NS) is not None
+                # Concatenate all text pieces in this run
+                txt = "".join((t.text or "") for t in node.findall(".//w:t", NS))
+                piece = html.escape(txt)
+                # Wrap in tags (nest strong outside em for determinism)
+                if is_bold and is_italic:
+                    piece = f"<strong><em>{piece}</em></strong>"
+                elif is_bold:
+                    piece = f"<strong>{piece}</strong>"
+                elif is_italic:
+                    piece = f"<em>{piece}</em>"
+                out.append(piece)
+                # Add explicit soft breaks or tabs inside the run
+                br_count = len(node.findall(".//w:br", NS))
+                if br_count:
+                    out.append("<br/>" * br_count)
+                tab_count = len(node.findall(".//w:tab", NS))
+                if tab_count:
+                    out.append("&emsp;" * tab_count)
+            elif tag == "{%s}br" % NS["w"]:
+                out.append("<br/>")
+            elif tag == "{%s}tab" % NS["w"]:
+                out.append("&emsp;")
+            else:
+                # Fallback: collect any text nodes if present
+                tnodes = [html.escape(t.text or "") for t in node.findall(".//w:t", NS)]
+                if tnodes:
+                    out.append("".join(tnodes))
+        return "".join(out)
+
+    chapters = []
+    current_title = None
+    current_paras = []
+
+    def flush_chapter():
+        if current_paras or current_title is not None:
+            body_html = "".join(current_paras).strip() or "<p></p>"
+            title = current_title or "Untitled"
+            chapters.append((title, body_html))
+
+    # Walk all paragraphs and split on Heading 1/2 if requested
+    for p in root.findall(".//w:p", NS):
+        # Determine paragraph style
+        pStyle = None
+        pPr = p.find("w:pPr", NS)
+        if pPr is not None:
+            ps = pPr.find("w:pStyle", NS)
+            if ps is not None and ps.get("{%s}val" % NS["w"]):
+                pStyle = ps.get("{%s}val" % NS["w"])
+        style_name = (style_name_by_id.get(pStyle, "") or "").lower()
+
+        inline_html = runs_to_inline_html(p).strip()
+
+        if not inline_html:
+            current_paras.append("<p></p>")
+            continue
+
+        if split_on_heading and (style_name.startswith("heading 1") or style_name.startswith("heading 2")):
+            # Close the previous chapter and start a new one with this heading as title
+            flush_chapter()
+            current_title = html.escape("".join((t.text or "") for t in p.findall(".//w:t", NS))).strip() or "Untitled"
+            current_paras = []
+        else:
+            current_paras.append(f"<p>{inline_html}</p>")
+
+    flush_chapter()
+
+    if not chapters:
+        # Fallback single chapter with entire document
+        body = []
+        for p in root.findall(".//w:p", NS):
+            inline_html = runs_to_inline_html(p).strip()
+            body.append(f"<p>{inline_html}</p>" if inline_html else "<p></p>")
+        chapters = [("Document", "".join(body) or "<p></p>")]
+
+    # Build a minimal EPUB 3
+    book_id = "urn:uuid:" + str(uuid.uuid4())
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def make_opf(n_items):
+        manifest_items, spine_items = [], []
+        for i in range(n_items):
+            manifest_items.append(f'<item id="c{i+1}" href="chapter-{i+1}.xhtml" media-type="application/xhtml+xml"/>')
+            spine_items.append(f'<itemref idref="c{i+1}"/>')
+        manifest = "\\n      ".join(
+            manifest_items + ['<item id="nav" href="nav.xhtml" properties="nav" media-type="application/xhtml+xml"/>']
+        )
+        spine = "\\n      ".join(spine_items)
+        return f"""<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="pub-id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="pub-id">{book_id}</dc:identifier>
+    <dc:title>Converted Document</dc:title>
+    <dc:language>en</dc:language>
+    <meta property="dcterms:modified">{now}</meta>
+  </metadata>
+  <manifest>
+      {manifest}
+  </manifest>
+  <spine>
+      {spine}
+  </spine>
+</package>"""
+
+    def make_nav(chaps):
+        items = []
+        for i, (title, _) in enumerate(chaps, 1):
+            t = title or f"Chapter {i}"
+            items.append(f'<li><a href="chapter-{i}.xhtml">{t}</a></li>')
+        ol = "\\n        ".join(items)
+        return f"""<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>Table of Contents</title><meta charset="utf-8"/></head>
+  <body>
+    <nav epub:type="toc" id="toc">
+      <h2>Contents</h2>
+      <ol>
+        {ol}
+      </ol>
+    </nav>
+  </body>
+</html>"""
+
+    def make_chapter(title, body_html):
+        return f"""<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>{title}</title><meta charset="utf-8"/></head>
+  <body>
+    <h1>{title}</h1>
+    {body_html}
+  </body>
+</html>"""
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as ez:
+        # 'mimetype' must be first and stored (no compression)
+        zinfo = zipfile.ZipInfo("mimetype")
+        zinfo.compress_type = zipfile.ZIP_STORED
+        ez.writestr(zinfo, "application/epub+zip")
+
+        ez.writestr(
+            "META-INF/container.xml",
+            """<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"""
+        )
+        ez.writestr("OEBPS/content.opf", make_opf(len(chapters)))
+        ez.writestr("OEBPS/nav.xhtml", make_nav(chapters))
+        for i, (title, body_html) in enumerate(chapters, 1):
+            ez.writestr(f"OEBPS/chapter-{i}.xhtml", make_chapter(title, body_html))
+
+    return out.getvalue()
+    def runs_to_inline_html(p_el):
+        """Return HTML for a paragraph, preserving <strong>/<em>, line breaks and tabs."""
+        out = []
+        for node in list(p_el):
+            tag = getattr(node, "tag", None)
+            if tag == "{%s}r" % NS["w"]:
+                rPr = node.find("w:rPr", NS)
+                is_bold = rPr is not None and rPr.find("w:b", NS) is not None
+                is_italic = rPr is not None and rPr.find("w:i", NS) is not None
+                # Concatenate all text pieces in this run
+                txt = "".join((t.text or "") for t in node.findall(".//w:t", NS))
+                piece = html.escape(txt)
+                # Wrap in tags (nest strong outside em for determinism)
+                if is_bold and is_italic:
+                    piece = f"<strong><em>{piece}</em></strong>"
+                elif is_bold:
+                    piece = f"<strong>{piece}</strong>"
+                elif is_italic:
+                    piece = f"<em>{piece}</em>"
+                out.append(piece)
+                # Add explicit soft breaks or tabs inside the run
+                br_count = len(node.findall(".//w:br", NS))
+                if br_count:
+                    out.append("<br/>" * br_count)
+                tab_count = len(node.findall(".//w:tab", NS))
+                if tab_count:
+                    out.append("&emsp;" * tab_count)
+            elif tag == "{%s}br" % NS["w"]:
+                out.append("<br/>")
+            elif tag == "{%s}tab" % NS["w"]:
+                out.append("&emsp;")
+            else:
+                # Fallback: collect any text nodes if present
+                tnodes = [html.escape(t.text or "") for t in node.findall(".//w:t", NS)]
+                if tnodes:
+                    out.append("".join(tnodes))
+        return "".join(out)
+
+    chapters = []
+    current_title = None
+    current_paras = []
+
+    def flush_chapter():
+        if current_paras or current_title is not None:
+            body_html = "".join(current_paras).strip() or "<p></p>"
+            title = current_title or "Untitled"
+            chapters.append((title, body_html))
+
+    # Walk all paragraphs and split on Heading 1/2 if requested
+    for p in root.findall(".//w:p", NS):
+        # Determine paragraph style
+        pStyle = None
+        pPr = p.find("w:pPr", NS)
+        if pPr is not None:
+            ps = pPr.find("w:pStyle", NS)
+            if ps is not None and ps.get("{%s}val" % NS["w"]):
+                pStyle = ps.get("{%s}val" % NS["w"])
+        style_name = (style_name_by_id.get(pStyle, "") or "").lower()
+
+        inline_html = runs_to_inline_html(p).strip()
+
+        if not inline_html:
+            current_paras.append("<p></p>")
+            continue
+
+        if split_on_heading and (style_name.startswith("heading 1") or style_name.startswith("heading 2")):
+            # Close the previous chapter and start a new one with this heading as title
+            flush_chapter()
+            current_title = html.escape("".join((t.text or "") for t in p.findall(".//w:t", NS))).strip() or "Untitled"
+            current_paras = []
+        else:
+            current_paras.append(f"<p>{inline_html}</p>")
+
+    flush_chapter()
+
+    if not chapters:
+        # Fallback single chapter with entire document
+        body = []
+        for p in root.findall(".//w:p", NS):
+            inline_html = runs_to_inline_html(p).strip()
+            body.append(f"<p>{inline_html}</p>" if inline_html else "<p></p>")
+        chapters = [("Document", "".join(body) or "<p></p>")]
+
+    # Build a minimal EPUB 3
+    book_id = "urn:uuid:" + str(uuid.uuid4())
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def make_opf(n_items):
+        manifest_items, spine_items = [], []
+        for i in range(n_items):
+            manifest_items.append(f'<item id="c{i+1}" href="chapter-{i+1}.xhtml" media-type="application/xhtml+xml"/>')
+            spine_items.append(f'<itemref idref="c{i+1}"/>')
+        manifest = "\\n      ".join(
+            manifest_items + ['<item id="nav" href="nav.xhtml" properties="nav" media-type="application/xhtml+xml"/>']
+        )
+        spine = "\\n      ".join(spine_items)
+        return f'''<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="pub-id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="pub-id">{book_id}</dc:identifier>
+    <dc:title>Converted Document</dc:title>
+    <dc:language>en</dc:language>
+    <meta property="dcterms:modified">{now}</meta>
+  </metadata>
+  <manifest>
+      {manifest}
+  </manifest>
+  <spine>
+      {spine}
+  </spine>
+</package>'''
+
+    def make_nav(chaps):
+        items = []
+        for i, (title, _) in enumerate(chaps, 1):
+            t = title or f"Chapter {i}"
+            items.append(f'<li><a href="chapter-{i}.xhtml">{t}</a></li>')
+        ol = "\\n        ".join(items)
+        return f'''<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>Table of Contents</title><meta charset="utf-8"/></head>
+  <body>
+    <nav epub:type="toc" id="toc">
+      <h2>Contents</h2>
+      <ol>
+        {ol}
+      </ol>
+    </nav>
+  </body>
+</html>'''
+
+    def make_chapter(title, body_html):
+        return f'''<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>{title}</title><meta charset="utf-8"/></head>
+  <body>
+    <h1>{title}</h1>
+    {body_html}
+  </body>
+</html>'''
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as ez:
+        # 'mimetype' must be first and stored (no compression)
+        zinfo = zipfile.ZipInfo("mimetype")
+        zinfo.compress_type = zipfile.ZIP_STORED
+        ez.writestr(zinfo, "application/epub+zip")
+
+        ez.writestr(
+            "META-INF/container.xml",
+            '''<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>'''
+        )
+        ez.writestr("OEBPS/content.opf", make_opf(len(chapters)))
+        ez.writestr("OEBPS/nav.xhtml", make_nav(chapters))
+        for i, (title, body_html) in enumerate(chapters, 1):
+            ez.writestr(f"OEBPS/chapter-{i}.xhtml", make_chapter(title, body_html))
+
+    return out.getvalue()
+    def runs_to_inline_html(p_el):
+        """Return HTML for a paragraph, preserving <strong>/<em>, line breaks and tabs."""
+        out = []
+        for node in list(p_el):
+            tag = getattr(node, "tag", None)
+            if tag == "{%s}r" % NS["w"]:
+                rPr = node.find("w:rPr", NS)
+                is_bold = rPr is not None and rPr.find("w:b", NS) is not None
+                is_italic = rPr is not None and rPr.find("w:i", NS) is not None
+                # Concatenate all text pieces in this run
+                txt = "".join((t.text or "") for t in node.findall(".//w:t", NS))
+                piece = html.escape(txt)
+                # Wrap in tags (nest strong outside em for determinism)
+                if is_bold and is_italic:
+                    piece = f"<strong><em>{piece}</em></strong>"
+                elif is_bold:
+                    piece = f"<strong>{piece}</strong>"
+                elif is_italic:
+                    piece = f"<em>{piece}</em>"
+                out.append(piece)
+                # Add explicit soft breaks or tabs inside the run
+                br_count = len(node.findall(".//w:br", NS))
+                if br_count:
+                    out.append("<br/>" * br_count)
+                tab_count = len(node.findall(".//w:tab", NS))
+                if tab_count:
+                    out.append("&emsp;" * tab_count)
+            elif tag == "{%s}br" % NS["w"]:
+                out.append("<br/>")
+            elif tag == "{%s}tab" % NS["w"]:
+                out.append("&emsp;")
+            else:
+                # Fallback: collect any text nodes if present
+                tnodes = [html.escape(t.text or "") for t in node.findall(".//w:t", NS)]
+                if tnodes:
+                    out.append("".join(tnodes))
+        return "".join(out)
+
+    chapters = []
+    current_title = None
+    current_paras = []
+
+    def flush_chapter():
+        if current_paras or current_title is not None:
+            body_html = "".join(current_paras).strip() or "<p></p>"
+            title = current_title or "Untitled"
+            chapters.append((title, body_html))
+
+    # Walk all paragraphs and split on Heading 1/2 if requested
+    for p in root.findall(".//w:p", NS):
+        # Determine paragraph style
+        pStyle = None
+        pPr = p.find("w:pPr", NS)
+        if pPr is not None:
+            ps = pPr.find("w:pStyle", NS)
+            if ps is not None and ps.get("{%s}val" % NS["w"]):
+                pStyle = ps.get("{%s}val" % NS["w"])
+        style_name = (style_name_by_id.get(pStyle, "") or "").lower()
+
+        inline_html = runs_to_inline_html(p).strip()
+
+        if not inline_html:
+            current_paras.append("<p></p>")
+            continue
+
+        if split_on_heading and (style_name.startswith("heading 1") or style_name.startswith("heading 2")):\
+            # Close the previous chapter and start a new one with this heading as title
+            flush_chapter()
+            current_title = html.escape("".join((t.text or "") for t in p.findall(".//w:t", NS))).strip() or "Untitled"
+            current_paras = []
+        else:
+            current_paras.append(f"<p>{inline_html}</p>")
+
+    flush_chapter()
+
+    if not chapters:
+        # Fallback single chapter with entire document
+        body = []
+        for p in root.findall(".//w:p", NS):
+            inline_html = runs_to_inline_html(p).strip()
+            body.append(f"<p>{inline_html}</p>" if inline_html else "<p></p>")
+        chapters = [("Document", "".join(body) or "<p></p>")]
+
+    # Build a minimal EPUB 3
+    book_id = "urn:uuid:" + str(uuid.uuid4())
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def make_opf(n_items):
+        manifest_items, spine_items = [], []
+        for i in range(n_items):
+            manifest_items.append(f'<item id="c{i+1}" href="chapter-{i+1}.xhtml" media-type="application/xhtml+xml"/>')
+            spine_items.append(f'<itemref idref="c{i+1}"/>')
+        manifest = "\\n      ".join(
+            manifest_items + ['<item id="nav" href="nav.xhtml" properties="nav" media-type="application/xhtml+xml"/>']
+        )
+        spine = "\\n      ".join(spine_items)
+        return f'''<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="pub-id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="pub-id">{book_id}</dc:identifier>
+    <dc:title>Converted Document</dc:title>
+    <dc:language>en</dc:language>
+    <meta property="dcterms:modified">{now}</meta>
+  </metadata>
+  <manifest>
+      {manifest}
+  </manifest>
+  <spine>
+      {spine}
+  </spine>
+</package>'''
+
+    def make_nav(chaps):
+        items = []
+        for i, (title, _) in enumerate(chaps, 1):
+            t = title or f"Chapter {i}"
+            items.append(f'<li><a href="chapter-{i}.xhtml">{t}</a></li>')
+        ol = "\\n        ".join(items)
+        return f'''<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>Table of Contents</title><meta charset="utf-8"/></head>
+  <body>
+    <nav epub:type="toc" id="toc">
+      <h2>Contents</h2>
+      <ol>
+        {ol}
+      </ol>
+    </nav>
+  </body>
+</html>'''
+
+    def make_chapter(title, body_html):
+        return f'''<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>{title}</title><meta charset="utf-8"/></head>
+  <body>
+    <h1>{title}</h1>
+    {body_html}
+  </body>
+</html>'''
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as ez:
+        # 'mimetype' must be first and stored (no compression)
+        zinfo = zipfile.ZipInfo("mimetype")
+        zinfo.compress_type = zipfile.ZIP_STORED
+        ez.writestr(zinfo, "application/epub+zip")
+
+        ez.writestr(
+            "META-INF/container.xml",
+            '''<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>'''
+        )
+        ez.writestr("OEBPS/content.opf", make_opf(len(chapters)))
+        ez.writestr("OEBPS/nav.xhtml", make_nav(chapters))
+        for i, (title, body_html) in enumerate(chapters, 1):
+            ez.writestr(f"OEBPS/chapter-{i}.xhtml", make_chapter(title, body_html))
+
+    return out.getvalue()
     def flush_chapter():
         if current_paras or current_title is not None:
             body_html = "".join(current_paras).strip() or "<p></p>"
@@ -65,15 +565,15 @@ def docx_bytes_to_epub3(docx_bytes: bytes, split_on_heading=True):
         for i in range(n_items):
             manifest_items.append('<item id="c%s" href="chapter-%s.xhtml" media-type="application/xhtml+xml"/>' % (i+1, i+1))
             spine_items.append('<itemref idref="c%s"/>' % (i+1))
-        manifest = "\n      ".join(manifest_items + ['<item id="nav" href="nav.xhtml" properties="nav" media-type="application/xhtml+xml"/>'])
-        spine = "\n      ".join(spine_items)
+        manifest = "\\n      ".join(manifest_items + ['<item id="nav" href="nav.xhtml" properties="nav" media-type="application/xhtml+xml"/>'])
+        spine = "\\n      ".join(spine_items)
         return '<?xml version="1.0" encoding="utf-8"?>\n<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="pub-id">\n  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n    <dc:identifier id="pub-id">%s</dc:identifier>\n    <dc:title>Converted Document</dc:title>\n    <dc:language>en</dc:language>\n    <meta property="dcterms:modified">%s</meta>\n  </metadata>\n  <manifest>\n      %s\n  </manifest>\n  <spine>\n      %s\n  </spine>\n</package>' % (book_id, now, manifest, spine)
     def make_nav(chapters):
         lis = []
         for i, (title, _) in enumerate(chapters, 1):
             t = title or "Chapter %s" % i
             lis.append('<li><a href="chapter-%s.xhtml">%s</a></li>' % (i, t))
-        ol = "\n        ".join(lis)
+        ol = "\\n        ".join(lis)
         return '<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>\n<html xmlns="http://www.w3.org/1999/xhtml">\n  <head><title>Table of Contents</title><meta charset="utf-8"/></head>\n  <body>\n    <nav epub:type="toc" id="toc">\n      <h2>Contents</h2>\n      <ol>\n        %s\n      </ol>\n    </nav>\n  </body>\n</html>' % ol
     def make_chapter(title, body):
         return '<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>\n<html xmlns="http://www.w3.org/1999/xhtml">\n  <head><title>%s</title><meta charset="utf-8"/></head>\n  <body>\n    <h1>%s</h1>\n    %s\n  </body>\n</html>' % (title, title, body)
