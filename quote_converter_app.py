@@ -585,7 +585,72 @@ if uploaded is not None:
     if st.button("Convert"):
         name_lower = uploaded.name.lower()
         
-# DOCX branch (robust; no reliance on name_lower; validates ZIP before using python-docx)
+# DOCX branch (robust; single error path; no reliance on name_lower)
+if uploaded is not None and (
+    str(getattr(uploaded, "name", "")).lower().endswith(".docx")
+    or getattr(uploaded, "type", "") in (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/msword",
+    )
+):
+    if Document is None:
+        st.error("python-docx not available; cannot process DOCX.")
+    else:
+        # Read the upload ONCE to avoid empty reads later
+        raw = uploaded.getvalue() if hasattr(uploaded, 'getvalue') else uploaded.read()
+
+        # Convert to cleaned DOCX bytes (if your converter exists). This should not error on non-ZIP.
+        try:
+            out_bytes = (
+                docx_bytes_to_us_quotes(raw)
+                if 'docx_bytes_to_us_quotes' in globals()
+                else (
+                    convert_docx_bytes_to_us(raw)
+                    if 'convert_docx_bytes_to_us' in globals()
+                    else raw
+                )
+            )
+        except Exception as conv_exc:
+            st.error("Conversion failed: %s" % conv_exc)
+            out_bytes = raw  # still allow EPUB attempt if raw is valid DOCX
+
+        # Always show DOCX download (whatever bytes we produced)
+        st.success("Converted. Download below.")
+        st.download_button(
+            "Download DOCX",
+            out_bytes,
+            file_name=getattr(uploaded, "name", "converted.docx"),
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+
+        # EPUB 3 generation: validate ZIP before python-docx; failures are WARNING-only, not ERROR
+        try:
+            def _is_zip(b):
+                return isinstance(b, (bytes, bytearray)) and len(b) >= 4 and b[:2] == b'PK'
+
+            docx_for_epub = out_bytes if _is_zip(out_bytes) else raw
+            if not _is_zip(docx_for_epub):
+                raise ValueError('Uploaded file is not a valid DOCX (ZIP) stream')
+
+            base = str(getattr(uploaded, 'name', 'document')).rsplit('.', 1)[0]
+            try:
+                author_meta = (
+                    getattr(_Document(io.BytesIO(docx_for_epub)).core_properties, 'author', None)
+                    or 'Unknown'
+                )
+            except Exception:
+                author_meta = 'Unknown'
+
+            if 'convert_docx_bytes_to_epub3' in globals():
+                epub_bytes = convert_docx_bytes_to_epub3(docx_for_epub, title=base, author=author_meta)
+                st.download_button(
+                    "Download EPUB (EPUB 3, split chapters & TOC)",
+                    epub_bytes,
+                    file_name=base + '.epub',
+                    mime='application/epub+zip',
+                )
+        except Exception as epub_exc:
+            st.warning('EPUB generation skipped: %s' % epub_exc)
 if uploaded is not None and (
     str(getattr(uploaded, "name", "")).lower().endswith(".docx")
     or getattr(uploaded, "type", "") in (
