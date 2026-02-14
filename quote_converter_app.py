@@ -3,7 +3,7 @@ from pathlib import Path
 
 def render_brand_header(logo_width_px: int = 200):
     """Render the brand header (logo left, text right) if logo.png is present beside this script."""
-    left, middle, right = st.columns([1, 2, 1], vertical_alignment="center")
+    left, middle, right = st.columns([1, 1, 1], vertical_alignment="center")
 
     with left:
         logo_path = Path(__file__).with_name("logo.png")
