@@ -1,5 +1,19 @@
 import io, os, re, tempfile, streamlit as st
 
+def render_brand_header(logo_width_px: int = 200):
+    """Render the brand header (logo left, text right) if logo.png is present beside this script."""
+    left, middle, right = st.columns([1, 3, 1], vertical_alignment="center")
+
+    with left:
+        logo_path = Path(__file__).with_name("logo.png")
+        if logo_path.exists():
+            st.image(str(logo_path), width=logo_width_px)
+
+    with right:
+        st.markdown('Created by David Winter  \n("The Narrator")  \nhttps://www.thenarrator.co.uk')
+
+    st.markdown("---")
+    
 # === DOCX -> EPUB 3 (from *converted* DOCX bytes) ===
 def docx_bytes_to_epub3(docx_bytes: bytes, split_on_heading=True):
     """Convert DOCX bytes to a minimal EPUB 3 that preserves bold/italics."""
@@ -1157,6 +1171,7 @@ input[type="file"] {
 """
 st.markdown("<style>\n"+CSS+"\n</style>", unsafe_allow_html=True)
 
+render_brand_header()
 st.title("UK to US Quote Converter with Optional PDF to DOCX Conversion")
 st.write("Please upload a docx using single-quotes dialogue for conversion to double-quotes dialogue, or upload a PDF of either type for conversion to double-quotes dialogue in a docx.")
 
