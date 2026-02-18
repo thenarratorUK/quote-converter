@@ -4,3 +4,4 @@ pdfminer.six
 PyPDF2
 pdf2docx==0.5.8
 PyMuPDF==1.26.4
+st-theme
