@@ -1,5 +1,6 @@
 import io, os, re, tempfile, streamlit as st
 from pathlib import Path
+from streamlit_theme import st_theme
 
 def render_brand_header(logo_width_px: int = 200):
     """Render the brand header (logo left, text right) if logo.png is present beside this script."""
